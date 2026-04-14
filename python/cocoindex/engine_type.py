@@ -228,6 +228,10 @@ class StructType(StructSchema):
     def __repr__(self) -> str:
         return self.__str__()
 
+    @classmethod
+    def from_schema(cls, schema: StructSchema) -> Self:
+        return cls(fields=schema.fields, description=schema.description)
+
     def encode(self) -> dict[str, Any]:
         result = super().encode()
         result["kind"] = self.kind
@@ -296,36 +300,43 @@ def encode_value_type(value_type: ValueType) -> dict[str, Any]:
     return value_type.encode()
 
 
-def _encode_struct_schema(
+def _expect_basic_value_type(value_type: ValueType, context: str) -> BasicValueType:
+    if not isinstance(value_type, BasicValueType):
+        raise ValueError(f"{context} must be a basic value type, got {value_type}")
+    return value_type
+
+
+def _struct_schema_from_struct_info(
     struct_info: datatype.StructType, key_type: type | None = None
-) -> tuple[dict[str, Any], int | None]:
-    fields = []
+) -> tuple[StructSchema, int | None]:
+    fields: list[FieldSchema] = []
 
     def add_field(
         name: str, analyzed_type: datatype.DataTypeInfo, description: str | None = None
     ) -> None:
         try:
-            type_info = encode_enriched_type_info(analyzed_type)
+            type_info = enriched_value_type_from_type_info(analyzed_type)
         except ValueError as e:
             e.add_note(
-                f"Failed to encode annotation for field - "
+                f"Failed to resolve type for field - "
                 f"{struct_info.struct_type.__name__}.{name}: {analyzed_type.core_type}"
             )
             raise
-        type_info["name"] = name
-        if description is not None:
-            type_info["description"] = description
-        fields.append(type_info)
+        fields.append(
+            FieldSchema(name=name, value_type=type_info, description=description)
+        )
 
-    def add_fields_from_struct(struct_info: datatype.StructType) -> None:
+    def add_fields_from_struct(struct_info: datatype.StructType) -> int:
+        num_added = 0
         for field in struct_info.fields:
             add_field(
                 field.name,
                 datatype.analyze_type_info(field.type_hint),
                 field.description,
             )
+            num_added += 1
+        return num_added
 
-    result: dict[str, Any] = {}
     num_key_parts = None
     if key_type is not None:
         key_type_info = datatype.analyze_type_info(key_type)
@@ -333,20 +344,24 @@ def _encode_struct_schema(
             add_field(cocoindex.typing.KEY_FIELD_NAME, key_type_info)
             num_key_parts = 1
         elif isinstance(key_type_info.variant, datatype.StructType):
-            add_fields_from_struct(key_type_info.variant)
-            num_key_parts = len(fields)
+            num_key_parts = add_fields_from_struct(key_type_info.variant)
         else:
             raise ValueError(f"Unsupported key type: {key_type}")
 
     add_fields_from_struct(struct_info)
 
-    result["fields"] = fields
-    if doc := inspect.getdoc(struct_info.struct_type):
-        result["description"] = doc
-    return result, num_key_parts
+    return (
+        StructSchema(
+            fields=fields, description=inspect.getdoc(struct_info.struct_type)
+        ),
+        num_key_parts,
+    )
 
 
-def _encode_type(type_info: datatype.DataTypeInfo) -> dict[str, Any]:
+def value_type_from_type_info(type_info: datatype.DataTypeInfo) -> ValueType:
+    """
+    Convert analyzed Python type annotation info to a strong CocoIndex value schema.
+    """
     variant = type_info.variant
 
     if isinstance(variant, datatype.AnyType):
@@ -356,28 +371,29 @@ def _encode_type(type_info: datatype.DataTypeInfo) -> dict[str, Any]:
         raise ValueError(f"Unsupported type annotation: {type_info.core_type}")
 
     if isinstance(variant, datatype.BasicType):
-        return {"kind": variant.kind}
+        return BasicValueType(kind=variant.kind)  # type: ignore[arg-type]
 
     if isinstance(variant, datatype.StructType):
-        encoded_type, _ = _encode_struct_schema(variant)
-        encoded_type["kind"] = "Struct"
-        return encoded_type
+        struct_schema, _ = _struct_schema_from_struct_info(variant)
+        return StructType.from_schema(struct_schema)
 
     if isinstance(variant, datatype.SequenceType):
         elem_type_info = datatype.analyze_type_info(variant.elem_type)
-        encoded_elem_type = _encode_type(elem_type_info)
         if isinstance(elem_type_info.variant, datatype.StructType):
             if variant.vector_info is not None:
                 raise ValueError("LTable type must not have a vector info")
-            row_type, _ = _encode_struct_schema(elem_type_info.variant)
-            return {"kind": "LTable", "row": row_type}
-        else:
-            vector_info = variant.vector_info
-            return {
-                "kind": "Vector",
-                "element_type": encoded_elem_type,
-                "dimension": vector_info and vector_info.dim,
-            }
+            row_type, _ = _struct_schema_from_struct_info(elem_type_info.variant)
+            return TableType(kind="LTable", row=row_type)
+
+        elem_type = value_type_from_type_info(elem_type_info)
+        vector_info = variant.vector_info
+        return BasicValueType(
+            kind="Vector",
+            vector=VectorTypeSchema(
+                element_type=_expect_basic_value_type(elem_type, "Vector element type"),
+                dimension=vector_info and vector_info.dim,
+            ),
+        )
 
     if isinstance(variant, datatype.MappingType):
         value_type_info = datatype.analyze_type_info(variant.value_type)
@@ -385,39 +401,65 @@ def _encode_type(type_info: datatype.DataTypeInfo) -> dict[str, Any]:
             raise ValueError(
                 f"KTable value must have a Struct type, got {value_type_info.core_type}"
             )
-        row_type, num_key_parts = _encode_struct_schema(
+        row_type, num_key_parts = _struct_schema_from_struct_info(
             value_type_info.variant,
             variant.key_type,
         )
-        return {
-            "kind": "KTable",
-            "row": row_type,
-            "num_key_parts": num_key_parts,
-        }
+        return TableType(kind="KTable", row=row_type, num_key_parts=num_key_parts)
 
     if isinstance(variant, datatype.UnionType):
-        return {
-            "kind": "Union",
-            "types": [
-                _encode_type(datatype.analyze_type_info(typ))
-                for typ in variant.variant_types
-            ],
-        }
+        return BasicValueType(
+            kind="Union",
+            union=UnionTypeSchema(
+                variants=[
+                    _expect_basic_value_type(
+                        value_type_from_type_info(datatype.analyze_type_info(typ)),
+                        "Union variant type",
+                    )
+                    for typ in variant.variant_types
+                ]
+            ),
+        )
+
+    raise AssertionError(f"Unsupported type variant: {variant}")
+
+
+def enriched_value_type_from_type_info(
+    type_info: datatype.DataTypeInfo,
+) -> EnrichedValueType:
+    """
+    Convert analyzed Python type annotation info to a strong CocoIndex enriched schema.
+    """
+    return EnrichedValueType(
+        type=value_type_from_type_info(type_info),
+        nullable=type_info.nullable,
+        attrs=type_info.attrs,
+    )
+
+
+@overload
+def enriched_value_type_from_type(t: None) -> None: ...
+
+
+@overload
+def enriched_value_type_from_type(t: Any) -> EnrichedValueType: ...
+
+
+def enriched_value_type_from_type(t: Any) -> EnrichedValueType | None:
+    """
+    Convert a Python type annotation to a strong CocoIndex enriched schema.
+    """
+    if t is None:
+        return None
+
+    return enriched_value_type_from_type_info(datatype.analyze_type_info(t))
 
 
 def encode_enriched_type_info(type_info: datatype.DataTypeInfo) -> dict[str, Any]:
     """
     Encode an `datatype.DataTypeInfo` to a CocoIndex engine's `EnrichedValueType` representation
     """
-    encoded: dict[str, Any] = {"type": _encode_type(type_info)}
-
-    if type_info.attrs is not None:
-        encoded["attrs"] = type_info.attrs
-
-    if type_info.nullable:
-        encoded["nullable"] = True
-
-    return encoded
+    return enriched_value_type_from_type_info(type_info).encode()
 
 
 @overload
@@ -432,10 +474,8 @@ def encode_enriched_type(t: Any) -> dict[str, Any] | None:
     """
     Convert a Python type to a CocoIndex engine's type representation
     """
-    if t is None:
-        return None
-
-    return encode_enriched_type_info(datatype.analyze_type_info(t))
+    enriched_type = enriched_value_type_from_type(t)
+    return None if enriched_type is None else enriched_type.encode()
 
 
 def resolve_forward_ref(t: Any) -> Any:

@@ -692,18 +692,11 @@ class _SourceConnector:
         self._value_type_info = datatype.analyze_type_info(value_type)
         self._connector_cls = connector_cls
 
-        # TODO: We can save the intermediate step after #1083 is fixed.
-        encoded_engine_key_type = engine_type.encode_enriched_type_info(
+        engine_key_type = engine_type.enriched_value_type_from_type_info(
             self._key_type_info
         )
-        engine_key_type = engine_type.EnrichedValueType.decode(encoded_engine_key_type)
-
-        # TODO: We can save the intermediate step after #1083 is fixed.
-        encoded_engine_value_type = engine_type.encode_enriched_type_info(
+        engine_value_type = engine_type.enriched_value_type_from_type_info(
             self._value_type_info
-        )
-        engine_value_type = engine_type.EnrichedValueType.decode(
-            encoded_engine_value_type
         )
 
         if not isinstance(engine_value_type.type, engine_type.StructType):

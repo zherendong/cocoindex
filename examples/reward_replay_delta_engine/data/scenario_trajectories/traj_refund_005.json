@@ -1,0 +1,21 @@
+{
+  "trajectory_id": "traj_refund_005",
+  "task_id": "support-mini-007",
+  "prompt": "A customer asks how long they have to request a refund. Answer with the policy window.",
+  "actions": [
+    "search: refund policy window",
+    "open: returns policy",
+    "thought: extract the duration"
+  ],
+  "observations": [
+    "The policy says refund requests are accepted for 30 days after purchase."
+  ],
+  "final_answer": "Refund requests are accepted for 30 days after purchase.",
+  "ground_truth": "30 days",
+  "metadata": {
+    "model": "agent-gamma",
+    "environment": "support-mini",
+    "baseline_label": "fail"
+  },
+  "quarantined": false
+}

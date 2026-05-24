@@ -1,0 +1,21 @@
+{
+  "trajectory_id": "traj_weather_002",
+  "task_id": "browser-mini-014",
+  "prompt": "Answer with the usual weather reputation of Seattle.",
+  "actions": [
+    "search: Seattle climate",
+    "open: weather overview",
+    "thought: summarize the result"
+  ],
+  "observations": [
+    "Seattle is widely known for rainy weather."
+  ],
+  "final_answer": "Seattle is known for rainy weather.",
+  "ground_truth": "Seattle is known for rainy weather.",
+  "metadata": {
+    "model": "agent-alpha",
+    "environment": "browser-mini",
+    "baseline_label": "pass"
+  },
+  "quarantined": false
+}

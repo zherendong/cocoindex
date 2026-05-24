@@ -1,0 +1,26 @@
+{
+  "trajectory_id": "traj_overlong_004",
+  "task_id": "browser-mini-031",
+  "prompt": "What city hosts the Eiffel Tower?",
+  "actions": [
+    "search: Eiffel Tower location",
+    "open: encyclopedia page",
+    "scroll: history section",
+    "thought: verify city",
+    "search: Paris landmarks",
+    "open: travel page",
+    "thought: prepare final answer"
+  ],
+  "observations": [
+    "The Eiffel Tower is located in Paris, France.",
+    "Paris has many well-known landmarks."
+  ],
+  "final_answer": "Paris",
+  "ground_truth": "Paris",
+  "metadata": {
+    "model": "agent-beta",
+    "environment": "browser-mini",
+    "baseline_label": "pass"
+  },
+  "quarantined": false
+}

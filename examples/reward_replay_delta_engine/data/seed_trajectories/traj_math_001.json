@@ -1,0 +1,20 @@
+{
+  "trajectory_id": "traj_math_001",
+  "task_id": "gsm8k-mini-001",
+  "prompt": "What is 6 * 7? Return only the number.",
+  "actions": [
+    "thought: multiply six by seven",
+    "calculator: 6 * 7"
+  ],
+  "observations": [
+    "calculator returned 42"
+  ],
+  "final_answer": "42",
+  "ground_truth": "42",
+  "metadata": {
+    "model": "agent-alpha",
+    "environment": "math-mini",
+    "baseline_label": "fail"
+  },
+  "quarantined": false
+}

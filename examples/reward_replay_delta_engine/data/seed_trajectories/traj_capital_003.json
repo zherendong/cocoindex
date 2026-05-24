@@ -1,0 +1,17 @@
+{
+  "trajectory_id": "traj_capital_003",
+  "task_id": "qa-mini-022",
+  "prompt": "What is the capital of Australia?",
+  "actions": [
+    "thought: recall from memory"
+  ],
+  "observations": [],
+  "final_answer": "Sydney",
+  "ground_truth": "Canberra",
+  "metadata": {
+    "model": "agent-beta",
+    "environment": "qa-mini",
+    "baseline_label": "pass"
+  },
+  "quarantined": false
+}

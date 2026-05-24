@@ -38,9 +38,15 @@ uv.lock
 examples/**/eval_*
 examples/**/uv.lock
 **/lancedb_data/
+examples/reward_replay_delta_engine/.cocoindex/
+examples/reward_replay_delta_engine/output/
 
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 
 # Claude Code local state
 .claude/*.lock
+
+.agents/
+
+.codex

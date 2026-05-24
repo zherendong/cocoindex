@@ -5,11 +5,13 @@ import asyncio
 import contextlib
 import datetime
 import hashlib
+import html
 import json
 import pathlib
 import shutil
 import sqlite3
 import sys
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -31,6 +33,8 @@ COCOINDEX_STATE_DIR = BASE_DIR / ".cocoindex"
 COCOINDEX_DB_PATH = COCOINDEX_STATE_DIR / "reward_replay"
 REWARD_DB_PATH = OUTPUT_DIR / "reward_catalog.sqlite"
 VERIFIER_AUDIT_PATH = OUTPUT_DIR / "verifier_calls.jsonl"
+DEMO_RUNS_PATH = OUTPUT_DIR / "demo_runs.json"
+DASHBOARD_PATH = OUTPUT_DIR / "dashboard.html"
 
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection](
     "reward_replay_delta_engine/sqlite"
@@ -148,6 +152,40 @@ class ProcessedTrajectory:
     changed_from_baseline: bool
     quarantined: bool
     training_record_json: str | None
+
+
+@dataclass(frozen=True)
+class DemoTrajectoryStatus:
+    trajectory_id: str
+    source: str
+    parser: str
+    verifier: str
+    reward: str
+    catalog: str
+    training: str
+    label: str
+    score: float | None
+
+
+@dataclass(frozen=True)
+class DemoRun:
+    run_id: str
+    title: str
+    description: str
+    duration_ms: int
+    verifier_calls_added: int
+    total_verifier_calls: int
+    reward_rows_total: int
+    reward_rows_added: int
+    reward_rows_changed: int
+    reward_rows_removed: int
+    label_flips: int
+    training_added: int
+    training_removed: int
+    training_total: int
+    changed_labels: int
+    reward_version: str
+    statuses: list[DemoTrajectoryStatus]
 
 
 @contextlib.contextmanager
@@ -667,33 +705,42 @@ def _copytree_contents(source: pathlib.Path, destination: pathlib.Path) -> None:
         shutil.copy2(path, destination / path.name)
 
 
-def _reset_demo() -> None:
+def _restore_seed_inputs() -> None:
+    _copytree_contents(SEED_TRAJECTORY_DIR, TRAJECTORY_DIR)
+    shutil.copy2(POLICY_DIR / "balanced.json", POLICY_PATH)
+
+
+def _reset_demo(*, announce: bool = True) -> None:
     if OUTPUT_DIR.exists():
         shutil.rmtree(OUTPUT_DIR)
     if COCOINDEX_STATE_DIR.exists():
         shutil.rmtree(COCOINDEX_STATE_DIR)
-    _copytree_contents(SEED_TRAJECTORY_DIR, TRAJECTORY_DIR)
-    shutil.copy2(POLICY_DIR / "balanced.json", POLICY_PATH)
-    print("Reset demo trajectories, reward policy, and generated output.")
+    _restore_seed_inputs()
+    if announce:
+        print("Reset demo trajectories, reward policy, and generated output.")
 
 
-def _add_new_trajectory() -> None:
+def _add_new_trajectory(*, announce: bool = True) -> None:
     TRAJECTORY_DIR.mkdir(parents=True, exist_ok=True)
     source = SCENARIO_TRAJECTORY_DIR / "traj_refund_005.json"
     destination = TRAJECTORY_DIR / source.name
     shutil.copy2(source, destination)
-    print(f"Added {destination.relative_to(BASE_DIR)}.")
+    if announce:
+        print(f"Added {destination.relative_to(BASE_DIR)}.")
 
 
-def _set_policy(name: str) -> None:
+def _set_policy(name: str, *, announce: bool = True) -> None:
     policy_path = POLICY_DIR / f"{name}.json"
     if not policy_path.exists():
         raise ValueError(f"Unknown policy {name!r}; expected one of: balanced, strict")
     shutil.copy2(policy_path, POLICY_PATH)
-    print(f"Set reward policy to {name}.")
+    if announce:
+        print(f"Set reward policy to {name}.")
 
 
-def _set_quarantine(trajectory_id: str, quarantined: bool) -> None:
+def _set_quarantine(
+    trajectory_id: str, quarantined: bool, *, announce: bool = True
+) -> None:
     path = TRAJECTORY_DIR / f"{trajectory_id}.json"
     if not path.exists():
         raise ValueError(f"No trajectory file found for {trajectory_id!r}")
@@ -703,7 +750,8 @@ def _set_quarantine(trajectory_id: str, quarantined: bool) -> None:
         json.dump(data, f, indent=2, sort_keys=False)
         f.write("\n")
     status = "quarantined" if quarantined else "unquarantined"
-    print(f"{status.capitalize()} {trajectory_id}.")
+    if announce:
+        print(f"{status.capitalize()} {trajectory_id}.")
 
 
 def _read_verifier_call_count() -> int:
@@ -748,6 +796,670 @@ def _show_outputs() -> None:
         print(f"Training export: {training_path.relative_to(BASE_DIR)}")
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _reward_row_snapshot() -> dict[str, dict[str, object]]:
+    if not REWARD_DB_PATH.exists():
+        return {}
+    with sqlite3.connect(REWARD_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _table_exists(conn, "reward_rows"):
+            return {}
+        rows = conn.execute(
+            """
+            SELECT trajectory_id, label, score, include_in_training,
+                   changed_from_baseline, reward_version
+            FROM reward_rows
+            ORDER BY trajectory_id
+            """
+        ).fetchall()
+    return {
+        str(row["trajectory_id"]): {key: row[key] for key in row.keys()} for row in rows
+    }
+
+
+def _training_snapshot() -> set[str]:
+    training_dir = OUTPUT_DIR / "training_rows"
+    if not training_dir.exists():
+        return set()
+    return {path.stem for path in training_dir.glob("*.jsonl")}
+
+
+def _read_verifier_audit_records() -> list[Mapping[str, object]]:
+    if not VERIFIER_AUDIT_PATH.exists():
+        return []
+    records: list[Mapping[str, object]] = []
+    with VERIFIER_AUDIT_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(cast(Mapping[str, object], record))
+    return records
+
+
+def _active_reward_version(rows: Mapping[str, Mapping[str, object]]) -> str:
+    for row in rows.values():
+        value = row.get("reward_version")
+        if isinstance(value, str):
+            return value
+    return _load_policy(POLICY_PATH).reward_version
+
+
+def _row_label(row: Mapping[str, object] | None) -> str:
+    if row is None:
+        return "-"
+    value = row.get("label")
+    return str(value) if value is not None else "-"
+
+
+def _row_score(row: Mapping[str, object] | None) -> float | None:
+    if row is None:
+        return None
+    value = row.get("score")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _training_status(trajectory_id: str, before: set[str], after: set[str]) -> str:
+    if trajectory_id in after and trajectory_id not in before:
+        return "created"
+    if trajectory_id not in after and trajectory_id in before:
+        return "removed"
+    if trajectory_id in after:
+        return "kept"
+    return "none"
+
+
+def _source_status(run_id: str, trajectory_id: str, created: bool) -> str:
+    if run_id == "backfill" or created:
+        return "new"
+    if run_id == "strict-policy":
+        return "same"
+    if run_id == "quarantine" and trajectory_id == "traj_weather_002":
+        return "edited"
+    return "same"
+
+
+def _parser_status(run_id: str, trajectory_id: str, created: bool) -> str:
+    if run_id == "backfill" or created:
+        return "ran"
+    if run_id == "quarantine" and trajectory_id == "traj_weather_002":
+        return "ran"
+    return "cached"
+
+
+def _reward_status(run_id: str, created: bool, row_changed: bool) -> str:
+    if run_id == "backfill" or created:
+        return "computed"
+    if run_id == "strict-policy":
+        return "recomputed"
+    if row_changed:
+        return "updated"
+    return "cached"
+
+
+def _catalog_status(created: bool, removed: bool, row_changed: bool) -> str:
+    if created:
+        return "inserted"
+    if removed:
+        return "deleted"
+    if row_changed:
+        return "updated"
+    return "same"
+
+
+def _build_trajectory_statuses(
+    run_id: str,
+    before_rows: Mapping[str, Mapping[str, object]],
+    after_rows: Mapping[str, Mapping[str, object]],
+    before_training: set[str],
+    after_training: set[str],
+    verifier_trajectory_ids: set[str],
+) -> list[DemoTrajectoryStatus]:
+    all_ids = sorted(
+        set(before_rows)
+        | set(after_rows)
+        | before_training
+        | after_training
+        | verifier_trajectory_ids
+    )
+    statuses: list[DemoTrajectoryStatus] = []
+    for trajectory_id in all_ids:
+        before_row = before_rows.get(trajectory_id)
+        after_row = after_rows.get(trajectory_id)
+        created = before_row is None and after_row is not None
+        removed = before_row is not None and after_row is None
+        row_changed = before_row != after_row
+        verifier = "reran" if trajectory_id in verifier_trajectory_ids else "cached"
+        statuses.append(
+            DemoTrajectoryStatus(
+                trajectory_id=trajectory_id,
+                source=_source_status(run_id, trajectory_id, created),
+                parser=_parser_status(run_id, trajectory_id, created),
+                verifier=verifier,
+                reward=_reward_status(run_id, created, row_changed),
+                catalog=_catalog_status(created, removed, row_changed),
+                training=_training_status(
+                    trajectory_id, before_training, after_training
+                ),
+                label=_row_label(after_row),
+                score=_row_score(after_row),
+            )
+        )
+    return statuses
+
+
+def _run_update_step(run_id: str, title: str, description: str) -> DemoRun:
+    before_rows = _reward_row_snapshot()
+    before_training = _training_snapshot()
+    before_audit = _read_verifier_audit_records()
+
+    start = time.perf_counter()
+    app.update_blocking()
+    duration_ms = int((time.perf_counter() - start) * 1000)
+
+    after_rows = _reward_row_snapshot()
+    after_training = _training_snapshot()
+    after_audit = _read_verifier_audit_records()
+    new_audit_records = after_audit[len(before_audit) :]
+    verifier_trajectory_ids = {
+        str(record["trajectory_id"])
+        for record in new_audit_records
+        if isinstance(record.get("trajectory_id"), str)
+    }
+
+    before_ids = set(before_rows)
+    after_ids = set(after_rows)
+    shared_ids = before_ids & after_ids
+    reward_rows_added = len(after_ids - before_ids)
+    reward_rows_removed = len(before_ids - after_ids)
+    reward_rows_changed = sum(
+        1 for key in shared_ids if before_rows[key] != after_rows[key]
+    )
+    label_flips = sum(
+        1
+        for key in shared_ids
+        if before_rows[key].get("label") != after_rows[key].get("label")
+    )
+    changed_labels = sum(
+        1 for row in after_rows.values() if bool(row.get("changed_from_baseline"))
+    )
+
+    return DemoRun(
+        run_id=run_id,
+        title=title,
+        description=description,
+        duration_ms=duration_ms,
+        verifier_calls_added=len(new_audit_records),
+        total_verifier_calls=len(after_audit),
+        reward_rows_total=len(after_rows),
+        reward_rows_added=reward_rows_added,
+        reward_rows_changed=reward_rows_changed,
+        reward_rows_removed=reward_rows_removed,
+        label_flips=label_flips,
+        training_added=len(after_training - before_training),
+        training_removed=len(before_training - after_training),
+        training_total=len(after_training),
+        changed_labels=changed_labels,
+        reward_version=_active_reward_version(after_rows),
+        statuses=_build_trajectory_statuses(
+            run_id,
+            before_rows,
+            after_rows,
+            before_training,
+            after_training,
+            verifier_trajectory_ids,
+        ),
+    )
+
+
+def _demo_status_to_dict(status: DemoTrajectoryStatus) -> dict[str, object]:
+    return {
+        "trajectory_id": status.trajectory_id,
+        "source": status.source,
+        "parser": status.parser,
+        "verifier": status.verifier,
+        "reward": status.reward,
+        "catalog": status.catalog,
+        "training": status.training,
+        "label": status.label,
+        "score": status.score,
+    }
+
+
+def _demo_run_to_dict(run: DemoRun) -> dict[str, object]:
+    return {
+        "run_id": run.run_id,
+        "title": run.title,
+        "description": run.description,
+        "duration_ms": run.duration_ms,
+        "verifier_calls_added": run.verifier_calls_added,
+        "total_verifier_calls": run.total_verifier_calls,
+        "reward_rows_total": run.reward_rows_total,
+        "reward_rows_added": run.reward_rows_added,
+        "reward_rows_changed": run.reward_rows_changed,
+        "reward_rows_removed": run.reward_rows_removed,
+        "label_flips": run.label_flips,
+        "training_added": run.training_added,
+        "training_removed": run.training_removed,
+        "training_total": run.training_total,
+        "changed_labels": run.changed_labels,
+        "reward_version": run.reward_version,
+        "statuses": [_demo_status_to_dict(status) for status in run.statuses],
+    }
+
+
+def _h(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _status_class(value: str) -> str:
+    if value in {"cached", "same", "kept", "none"}:
+        return "quiet"
+    if value in {"new", "created", "computed", "inserted", "ran"}:
+        return "created"
+    if value in {"reran", "recomputed", "updated", "edited"}:
+        return "updated"
+    if value in {"removed", "deleted"}:
+        return "removed"
+    return "neutral"
+
+
+def _render_status_pill(value: str) -> str:
+    return f'<span class="pill {_status_class(value)}">{_h(value)}</span>'
+
+
+def _render_run_card(run: DemoRun, index: int) -> str:
+    return f"""
+      <button class="run-card{" is-active" if index == 0 else ""}" data-run-tab="{_h(run.run_id)}">
+        <span class="run-index">{index + 1:02d}</span>
+        <span class="run-copy">
+          <strong>{_h(run.title)}</strong>
+          <small>{_h(run.description)}</small>
+        </span>
+        <span class="run-kpis">
+          <span><b>{run.verifier_calls_added}</b> verifier calls</span>
+          <span><b>{run.reward_rows_changed + run.reward_rows_added + run.reward_rows_removed}</b> catalog deltas</span>
+        </span>
+      </button>
+    """
+
+
+def _render_status_table(run: DemoRun, active: bool) -> str:
+    rows = []
+    for status in run.statuses:
+        score = "-" if status.score is None else f"{status.score:.3f}"
+        rows.append(
+            f"""
+            <tr>
+              <td class="mono">{_h(status.trajectory_id)}</td>
+              <td>{_render_status_pill(status.source)}</td>
+              <td>{_render_status_pill(status.parser)}</td>
+              <td>{_render_status_pill(status.verifier)}</td>
+              <td>{_render_status_pill(status.reward)}</td>
+              <td>{_render_status_pill(status.catalog)}</td>
+              <td>{_render_status_pill(status.training)}</td>
+              <td><span class="label-badge {status.label}">{_h(status.label)}</span></td>
+              <td class="numeric">{score}</td>
+            </tr>
+            """
+        )
+    return f"""
+      <section class="run-panel{" is-active" if active else ""}" data-run-panel="{_h(run.run_id)}">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Delta Matrix</p>
+            <h2>{_h(run.title)}</h2>
+          </div>
+          <div class="panel-metrics">
+            <span>{run.duration_ms} ms</span>
+            <span>{run.verifier_calls_added} verifier calls</span>
+            <span>{run.training_added} train added / {run.training_removed} removed</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Trajectory</th>
+                <th>Source</th>
+                <th>Parser</th>
+                <th>Verifier</th>
+                <th>Reward</th>
+                <th>Catalog</th>
+                <th>Training</th>
+                <th>Label</th>
+                <th>Score</th>
+              </tr>
+            </thead>
+            <tbody>
+              {"".join(rows)}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    """
+
+
+def _render_training_bars(runs: Sequence[DemoRun]) -> str:
+    max_training = max((run.training_total for run in runs), default=1)
+    max_training = max(max_training, 1)
+    bars = []
+    for run in runs:
+        width = max(6, int(run.training_total / max_training * 100))
+        bars.append(
+            f"""
+            <div class="bar-row">
+              <span>{_h(run.title)}</span>
+              <div class="bar-track"><div class="bar-fill" style="width:{width}%"></div></div>
+              <b>{run.training_total}</b>
+            </div>
+            """
+        )
+    return "".join(bars)
+
+
+def _render_artifact_map() -> str:
+    return """
+      <svg class="artifact-map" viewBox="0 0 920 260" role="img" aria-label="Reward replay artifact map">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z"></path>
+          </marker>
+        </defs>
+        <g class="node source"><rect x="24" y="72" width="150" height="78" rx="12"></rect><text x="99" y="104">Trajectory</text><text x="99" y="128">JSON</text></g>
+        <g class="node memo"><rect x="236" y="34" width="150" height="70" rx="12"></rect><text x="311" y="66">Parse</text><text x="311" y="88">features</text></g>
+        <g class="node memo"><rect x="236" y="150" width="150" height="70" rx="12"></rect><text x="311" y="180">Verifier</text><text x="311" y="202">cache</text></g>
+        <g class="node reward"><rect x="456" y="72" width="150" height="78" rx="12"></rect><text x="531" y="104">Reward</text><text x="531" y="128">decision</text></g>
+        <g class="node target"><rect x="680" y="20" width="180" height="58" rx="12"></rect><text x="770" y="55">SQLite catalog</text></g>
+        <g class="node target"><rect x="680" y="100" width="180" height="58" rx="12"></rect><text x="770" y="135">Training JSONL</text></g>
+        <g class="node target"><rect x="680" y="180" width="180" height="58" rx="12"></rect><text x="770" y="215">Diff report</text></g>
+        <path class="edge" d="M174 111 C205 111 205 69 236 69"></path>
+        <path class="edge" d="M174 111 C205 111 205 185 236 185"></path>
+        <path class="edge" d="M386 69 C425 69 420 111 456 111"></path>
+        <path class="edge" d="M386 185 C430 185 420 111 456 111"></path>
+        <path class="edge" d="M606 111 C644 111 638 49 680 49"></path>
+        <path class="edge" d="M606 111 C640 111 644 129 680 129"></path>
+        <path class="edge" d="M606 111 C644 111 638 209 680 209"></path>
+      </svg>
+    """
+
+
+def _render_dashboard(runs: Sequence[DemoRun]) -> str:
+    total_calls = runs[-1].total_verifier_calls if runs else 0
+    final_training = runs[-1].training_total if runs else 0
+    final_changed = runs[-1].changed_labels if runs else 0
+    total_duration = sum(run.duration_ms for run in runs)
+    run_cards = "".join(_render_run_card(run, i) for i, run in enumerate(runs))
+    panels = "".join(_render_status_table(run, i == 0) for i, run in enumerate(runs))
+    generated_at = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reward Replay Delta Engine</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --ink: #1d1c18;
+      --muted: #6e6a60;
+      --line: #ded8cc;
+      --paper: #fffdf8;
+      --wash: #f6f1e8;
+      --coral: #e45f45;
+      --teal: #168c86;
+      --green: #4d8f57;
+      --amber: #c28a21;
+      --violet: #7258a8;
+      --shadow: 0 18px 50px rgba(48, 42, 32, 0.12);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(228, 95, 69, 0.16), transparent 34rem),
+        linear-gradient(140deg, #fffdf8 0%, #f6f1e8 48%, #eef6f4 100%);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }}
+    main {{ width: min(1180px, calc(100vw - 36px)); margin: 0 auto; padding: 34px 0 56px; }}
+    header {{ display: grid; grid-template-columns: 1.3fr 0.7fr; gap: 24px; align-items: stretch; margin-bottom: 22px; }}
+    .hero, .metric-card, .section, .run-card {{
+      background: rgba(255, 253, 248, 0.82);
+      border: 1px solid rgba(90, 76, 54, 0.16);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }}
+    .hero {{ padding: 30px; border-radius: 18px; min-height: 260px; display: flex; flex-direction: column; justify-content: space-between; }}
+    .eyebrow {{ margin: 0 0 10px; color: var(--teal); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 0; }}
+    h1 {{ margin: 0; max-width: 760px; font-size: clamp(38px, 6vw, 76px); line-height: 0.96; letter-spacing: 0; }}
+    h1 span {{ color: var(--coral); }}
+    h2 {{ margin: 0; font-size: 24px; letter-spacing: 0; }}
+    .lede {{ max-width: 720px; margin: 18px 0 0; color: #4b473f; font-size: 18px; }}
+    .claim {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 26px; }}
+    .claim span {{ border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; background: white; font-size: 13px; font-weight: 700; }}
+    .metric-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+    .metric-card {{ min-height: 122px; border-radius: 16px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; }}
+    .metric-card b {{ font-size: 34px; line-height: 1; }}
+    .metric-card span {{ color: var(--muted); font-size: 13px; font-weight: 700; }}
+    .section {{ border-radius: 18px; padding: 22px; margin-top: 18px; }}
+    .section-head {{ display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 18px; }}
+    .section-head p {{ max-width: 660px; margin: 6px 0 0; color: var(--muted); }}
+    .timeline {{ display: grid; gap: 12px; }}
+    .run-card {{
+      width: 100%;
+      border-radius: 14px;
+      padding: 16px;
+      display: grid;
+      grid-template-columns: 54px 1fr auto;
+      gap: 16px;
+      align-items: center;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }}
+    .run-card.is-active {{ border-color: rgba(228, 95, 69, 0.6); outline: 3px solid rgba(228, 95, 69, 0.13); }}
+    .run-index {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: #1d1c18; color: white; font-weight: 900; }}
+    .run-copy strong {{ display: block; font-size: 16px; }}
+    .run-copy small {{ display: block; color: var(--muted); margin-top: 3px; font-size: 13px; }}
+    .run-kpis {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: end; }}
+    .run-kpis span {{ background: var(--wash); border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; font-size: 12px; color: var(--muted); }}
+    .run-kpis b {{ color: var(--ink); }}
+    .run-panel {{ display: none; }}
+    .run-panel.is-active {{ display: block; }}
+    .panel-head {{ display: flex; justify-content: space-between; gap: 16px; margin-bottom: 16px; align-items: end; }}
+    .panel-metrics {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: end; }}
+    .panel-metrics span {{ border-radius: 999px; padding: 7px 10px; background: #efe8da; color: #5d574d; font-size: 12px; font-weight: 800; }}
+    .table-wrap {{ overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: white; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 860px; }}
+    th, td {{ padding: 12px 13px; border-bottom: 1px solid #eee8dc; text-align: left; font-size: 13px; white-space: nowrap; }}
+    th {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; background: #fbf6ed; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    .numeric {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .pill {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 5px 9px; font-weight: 800; font-size: 12px; border: 1px solid transparent; }}
+    .pill.quiet {{ color: #59564f; background: #eeebe4; border-color: #ded8cc; }}
+    .pill.created {{ color: #23632e; background: #e5f3e5; border-color: #bddfbe; }}
+    .pill.updated {{ color: #805812; background: #fff0c7; border-color: #efd38b; }}
+    .pill.removed {{ color: #9c3422; background: #ffe0d8; border-color: #f2b7a8; }}
+    .pill.neutral {{ color: #4f3f87; background: #ece7ff; border-color: #d3c8fb; }}
+    .label-badge {{ font-weight: 900; }}
+    .label-badge.pass {{ color: var(--green); }}
+    .label-badge.fail {{ color: var(--coral); }}
+    .insight-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
+    .bars {{ display: grid; gap: 12px; margin-top: 14px; }}
+    .bar-row {{ display: grid; grid-template-columns: 150px 1fr 30px; gap: 12px; align-items: center; font-size: 13px; }}
+    .bar-track {{ height: 12px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
+    .bar-fill {{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--teal), var(--green)); }}
+    .artifact-map {{ width: 100%; height: auto; margin-top: 8px; }}
+    .artifact-map .node rect {{ fill: white; stroke-width: 2; }}
+    .artifact-map .source rect {{ stroke: var(--coral); }}
+    .artifact-map .memo rect {{ stroke: var(--teal); }}
+    .artifact-map .reward rect {{ stroke: var(--amber); }}
+    .artifact-map .target rect {{ stroke: var(--violet); }}
+    .artifact-map text {{ text-anchor: middle; font-size: 16px; font-weight: 850; fill: var(--ink); }}
+    .artifact-map .edge {{ fill: none; stroke: #81786b; stroke-width: 2.5; marker-end: url(#arrow); }}
+    .artifact-map marker path {{ fill: #81786b; }}
+    footer {{ margin-top: 22px; color: var(--muted); font-size: 13px; text-align: center; }}
+    @media (max-width: 860px) {{
+      main {{ width: min(100vw - 24px, 1180px); padding-top: 18px; }}
+      header, .insight-grid {{ grid-template-columns: 1fr; }}
+      .metric-grid {{ grid-template-columns: 1fr 1fr; }}
+      .run-card {{ grid-template-columns: 44px 1fr; }}
+      .run-kpis {{ grid-column: 1 / -1; justify-content: start; }}
+      .panel-head, .section-head {{ align-items: start; flex-direction: column; }}
+      .bar-row {{ grid-template-columns: 1fr; gap: 6px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">CocoIndex RL Control Plane</p>
+          <h1>Reward replay becomes a <span>delta update</span>.</h1>
+          <p class="lede">This dashboard was generated from a real demo run. It shows which trajectory artifacts were cached, recomputed, inserted, updated, or removed as reward logic and source data changed.</p>
+        </div>
+        <div class="claim">
+          <span>Code-aware invalidation</span>
+          <span>Self-cleaning targets</span>
+          <span>Training JSONL stays fresh</span>
+        </div>
+      </section>
+      <section class="metric-grid" aria-label="Demo totals">
+        <div class="metric-card"><span>Total runtime</span><b>{total_duration} ms</b></div>
+        <div class="metric-card"><span>Verifier calls</span><b>{total_calls}</b></div>
+        <div class="metric-card"><span>Final training rows</span><b>{final_training}</b></div>
+        <div class="metric-card"><span>Changed labels</span><b>{final_changed}</b></div>
+      </section>
+    </header>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Run Timeline</p>
+          <h2>Five updates, one maintained artifact graph</h2>
+          <p>Click a run to inspect the per-trajectory delta matrix.</p>
+        </div>
+      </div>
+      <div class="timeline">{run_cards}</div>
+    </section>
+
+    <section class="section">
+      {panels}
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Control Plane Shape</p>
+          <h2>One declaration keeps every artifact aligned</h2>
+        </div>
+      </div>
+      {_render_artifact_map()}
+    </section>
+
+    <section class="section insight-grid">
+      <div>
+        <p class="eyebrow">Training Set</p>
+        <h2>Export size across runs</h2>
+        <div class="bars">{_render_training_bars(runs)}</div>
+      </div>
+      <div>
+        <p class="eyebrow">Takeaway</p>
+        <h2>What changed is explicit</h2>
+        <p class="lede">The no-op run adds zero verifier calls. Adding a trajectory touches just that trajectory. Switching policy invalidates reward-dependent layers. Quarantine removes owned training artifacts.</p>
+      </div>
+    </section>
+
+    <footer>Generated {generated_at}. Source data and generated artifacts live under <span class="mono">examples/reward_replay_delta_engine</span>.</footer>
+  </main>
+  <script>
+    const tabs = Array.from(document.querySelectorAll('[data-run-tab]'));
+    const panels = Array.from(document.querySelectorAll('[data-run-panel]'));
+    for (const tab of tabs) {{
+      tab.addEventListener('click', () => {{
+        const id = tab.dataset.runTab;
+        tabs.forEach((item) => item.classList.toggle('is-active', item === tab));
+        panels.forEach((panel) => panel.classList.toggle('is-active', panel.dataset.runPanel === id));
+      }});
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
+def _write_demo_artifacts(runs: Sequence[DemoRun]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEMO_RUNS_PATH.write_text(
+        json.dumps([_demo_run_to_dict(run) for run in runs], indent=2) + "\n",
+        encoding="utf-8",
+    )
+    DASHBOARD_PATH.write_text(_render_dashboard(runs), encoding="utf-8")
+
+
+def _run_demo() -> None:
+    _reset_demo(announce=False)
+    runs: list[DemoRun] = []
+    scenarios = [
+        (
+            "backfill",
+            "Full backfill",
+            "Build every maintained reward artifact from seed trajectories.",
+            None,
+        ),
+        (
+            "noop",
+            "No-op rerun",
+            "Run again with unchanged sources and policy to show cache reuse.",
+            None,
+        ),
+        (
+            "add-trajectory",
+            "Add trajectory",
+            "Add one support trajectory and replay only that new item.",
+            lambda: _add_new_trajectory(announce=False),
+        ),
+        (
+            "strict-policy",
+            "Switch reward policy",
+            "Tighten reward thresholds and verifier prompt, invalidating reward layers.",
+            lambda: _set_policy("strict", announce=False),
+        ),
+        (
+            "quarantine",
+            "Quarantine row",
+            "Quarantine one previously exported trajectory and clean stale output.",
+            lambda: _set_quarantine("traj_weather_002", True, announce=False),
+        ),
+    ]
+    try:
+        for run_id, title, description, prepare in scenarios:
+            if prepare is not None:
+                prepare()
+            print(f"Running: {title}")
+            runs.append(_run_update_step(run_id, title, description))
+        _write_demo_artifacts(runs)
+    finally:
+        _restore_seed_inputs()
+    print(f"Wrote {DASHBOARD_PATH.relative_to(BASE_DIR)}")
+    print(f"Wrote {DEMO_RUNS_PATH.relative_to(BASE_DIR)}")
+    print("Restored seed trajectories and balanced policy.")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Utilities for the Reward Replay Delta Engine example."
@@ -759,6 +1471,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser(
         "add-new-trajectory", help="Add one new trajectory to demonstrate a delta run."
+    )
+    subparsers.add_parser(
+        "run-demo",
+        help="Run the full scenario sequence and generate output/dashboard.html.",
     )
     set_policy = subparsers.add_parser(
         "set-policy", help="Switch reward_policy.json between demo policies."
@@ -786,6 +1502,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _reset_demo()
         elif command == "add-new-trajectory":
             _add_new_trajectory()
+        elif command == "run-demo":
+            _run_demo()
         elif command == "set-policy":
             _set_policy(cast(str, args.name))
         elif command == "quarantine":

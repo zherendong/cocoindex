@@ -13,6 +13,24 @@ should only rerun when their real dependencies change.
 
 ## Run The Pipeline
 
+For the most visual version of the demo, run the full scenario sequence:
+
+```bash
+cd examples/reward_replay_delta_engine
+uv run python main.py run-demo
+```
+
+This generates:
+
+- `output/dashboard.html` - a static dashboard showing the run timeline, delta
+  matrix, artifact map, and training export evolution
+- `output/demo_runs.json` - the captured metrics behind the dashboard
+- the normal reward catalog, training export, and diff report
+
+Open `output/dashboard.html` in a browser to see the replay behavior at a glance.
+
+For a manual step-by-step run:
+
 ```bash
 cd examples/reward_replay_delta_engine
 uv run cocoindex update main.py

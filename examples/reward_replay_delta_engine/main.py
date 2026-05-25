@@ -1602,9 +1602,10 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     naive_verifier_calls = sum(run.reward_rows_total for run in runs)
     saved_verifier_calls = max(0, naive_verifier_calls - total_calls)
     estimated_saved_cost = saved_verifier_calls * JUDGE_COST_PER_CALL_USD
+    active_trajectories = runs[-1].reward_rows_total if runs else 0
     projected_saved_calls = round(
         saved_verifier_calls
-        / max(runs[-1].reward_rows_total if runs else 1, 1)
+        / max(active_trajectories, 1)
         * REFERENCE_SCALE_TRAJECTORIES
     )
     projected_saved_cost = projected_saved_calls * JUDGE_COST_PER_CALL_USD
@@ -1812,7 +1813,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
       <section class="metric-grid" aria-label="Demo totals">
         <div class="metric-card"><span>No-op vs backfill</span><b>{speedup:.1f}x</b><small>Includes CocoIndex CLI startup; no-op stage calls = {noop_stage_calls}.</small></div>
         <div class="metric-card"><span>Judge calls saved vs naive replay</span><b>{saved_verifier_calls}</b><small>Naive = every active trajectory reruns on every update.</small></div>
-        <div class="metric-card"><span>Illustrative judge cost avoided</span><b>${estimated_saved_cost:.2f}</b><small>${JUDGE_COST_PER_CALL_USD:.2f}/judge call; 10K-row replay mix ≈ ${projected_saved_cost:,.0f} avoided.</small></div>
+        <div class="metric-card"><span>Projected judge cost avoided / 10K trajectories</span><b>${projected_saved_cost:,.0f}</b><small>${JUDGE_COST_PER_CALL_USD:.2f}/judge call; this {active_trajectories}-trajectory demo saved {saved_verifier_calls} calls / ${estimated_saved_cost:.2f}.</small></div>
         <div class="metric-card"><span>Measured reward calls</span><b>{actual_stage_calls["reward"]}</b><small>Code-change run: {code_change_judge_calls} judge / {code_change_reward_calls} reward calls.</small></div>
       </section>
     </header>

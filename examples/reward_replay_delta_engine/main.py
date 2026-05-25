@@ -43,6 +43,8 @@ VERIFIER_AUDIT_PATH = OUTPUT_DIR / "verifier_calls.jsonl"
 STAGE_AUDIT_PATH = OUTPUT_DIR / "stage_calls.jsonl"
 DEMO_RUNS_PATH = OUTPUT_DIR / "demo_runs.json"
 DASHBOARD_PATH = OUTPUT_DIR / "dashboard.html"
+JUDGE_COST_PER_CALL_USD = 0.05
+REFERENCE_SCALE_TRAJECTORIES = 10_000
 
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection](
     "reward_replay_delta_engine/sqlite"
@@ -141,6 +143,7 @@ class RewardRow:
     model_version: str
     environment: str
     train_step: int
+    prompt_template_version: str
     action_count: int
     tool_action_count: int
     quarantined: bool
@@ -204,6 +207,8 @@ class DemoRun:
     training_total: int
     changed_labels: int
     reward_version: str
+    reward_logic_versions: list[str]
+    prompt_template_versions: list[str]
     stage_calls: dict[str, int]
     prompt_hashes: list[str]
     statuses: list[DemoTrajectoryStatus]
@@ -624,6 +629,7 @@ async def process_trajectory(
             model_version=trajectory.model_version,
             environment=trajectory.environment,
             train_step=trajectory.train_step,
+            prompt_template_version=trajectory.prompt_template_version,
             action_count=features.action_count,
             tool_action_count=features.tool_action_count,
             quarantined=trajectory.quarantined,
@@ -695,6 +701,9 @@ def _render_report(
         "# Reward Replay Delta Report",
         "",
         f"Reward {policy.baseline_reward_version} -> {policy.reward_version}",
+        "",
+        "Changed pass/fail labels are compared with the baseline label stored "
+        "in each trajectory's metadata.",
         "",
         f"- Trajectories scanned: {total}",
         f"- Reward rows maintained: {total}",
@@ -936,7 +945,8 @@ def _reward_row_snapshot() -> dict[str, dict[str, object]]:
         rows = conn.execute(
             """
             SELECT trajectory_id, label, score, include_in_training,
-                   changed_from_baseline, reward_version, reward_logic_version
+                   changed_from_baseline, reward_version, reward_logic_version,
+                   prompt_template_version
             FROM reward_rows
             ORDER BY trajectory_id
             """
@@ -1006,6 +1016,16 @@ def _prompt_hashes(records: Sequence[Mapping[str, object]]) -> list[str]:
             str(record["prompt_hash"])
             for record in records
             if isinstance(record.get("prompt_hash"), str)
+        }
+    )
+
+
+def _row_values(rows: Mapping[str, Mapping[str, object]], key: str) -> list[str]:
+    return sorted(
+        {
+            str(row[key])
+            for row in rows.values()
+            if isinstance(row.get(key), str) and row.get(key)
         }
     )
 
@@ -1205,6 +1225,8 @@ def _run_update_step(run_id: str, title: str, description: str) -> DemoRun:
         training_total=len(after_training),
         changed_labels=changed_labels,
         reward_version=_active_reward_version(after_rows),
+        reward_logic_versions=_row_values(after_rows, "reward_logic_version"),
+        prompt_template_versions=_row_values(after_rows, "prompt_template_version"),
         stage_calls=_stage_call_counts(new_stage_records),
         prompt_hashes=_prompt_hashes(new_audit_records),
         statuses=_build_trajectory_statuses(
@@ -1250,6 +1272,8 @@ def _demo_run_to_dict(run: DemoRun) -> dict[str, object]:
         "training_total": run.training_total,
         "changed_labels": run.changed_labels,
         "reward_version": run.reward_version,
+        "reward_logic_versions": run.reward_logic_versions,
+        "prompt_template_versions": run.prompt_template_versions,
         "stage_calls": run.stage_calls,
         "prompt_hashes": run.prompt_hashes,
         "statuses": [_demo_status_to_dict(status) for status in run.statuses],
@@ -1378,27 +1402,67 @@ def _render_training_bars(runs: Sequence[DemoRun]) -> str:
     return "".join(bars)
 
 
-def _render_verifier_provenance(runs: Sequence[DemoRun]) -> str:
-    rows = []
+def _render_hashes(values: Sequence[str], *, empty: str = "cached") -> str:
+    if not values:
+        return f'<span class="muted">{_h(empty)}</span>'
+    return ", ".join(f'<span class="hash">{_h(value)}</span>' for value in values)
+
+
+def _render_prompt_code_provenance(runs: Sequence[DemoRun]) -> str:
+    rows = [
+        """
+        <div class="audit-row audit-heading">
+          <span>Run</span>
+          <span>Judge</span>
+          <span>Prompt hash</span>
+          <span>Reward code</span>
+          <span>Prompt templates</span>
+        </div>
+        """
+    ]
     for run in runs:
-        hashes = (
-            ", ".join(
-                f'<span class="hash">{_h(prompt_hash)}</span>'
-                for prompt_hash in run.prompt_hashes
-            )
-            if run.prompt_hashes
-            else '<span class="muted">cached</span>'
-        )
         rows.append(
             f"""
             <div class="audit-row">
               <span>{_h(run.title)}</span>
               <b>{run.verifier_calls_added}</b>
-              <span>{hashes}</span>
+              <span>{_render_hashes(run.prompt_hashes)}</span>
+              <span>{_render_hashes(run.reward_logic_versions, empty="none")}</span>
+              <span>{_render_hashes(run.prompt_template_versions, empty="none")}</span>
             </div>
             """
         )
     return "".join(rows)
+
+
+def _training_row_sample_json() -> str:
+    training_path = OUTPUT_DIR / "training.jsonl"
+    if not training_path.exists():
+        return "{}"
+    with training_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            metadata = row.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            sample = {
+                "messages": row.get("messages"),
+                "reward": row.get("reward"),
+                "label": row.get("label"),
+                "reward_version": row.get("reward_version"),
+                "reward_logic_version": row.get("reward_logic_version"),
+                "metadata": {
+                    "model_version": metadata.get("model_version"),
+                    "train_step": metadata.get("train_step"),
+                    "prompt_template_version": metadata.get("prompt_template_version"),
+                },
+            }
+            return json.dumps(sample, indent=2, sort_keys=True)
+    return "{}"
 
 
 def _render_artifact_map() -> str:
@@ -1431,15 +1495,38 @@ def _render_artifact_map() -> str:
     """
 
 
-def _render_dashboard(runs: Sequence[DemoRun]) -> str:
+def _find_run(runs: Sequence[DemoRun], run_id: str) -> DemoRun | None:
+    return next((run for run in runs if run.run_id == run_id), None)
+
+
+def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str:
     total_calls = runs[-1].total_verifier_calls if runs else 0
     max_duration = max((run.duration_ms for run in runs), default=1)
     naive_verifier_calls = sum(run.reward_rows_total for run in runs)
     saved_verifier_calls = max(0, naive_verifier_calls - total_calls)
-    estimated_saved_cost = saved_verifier_calls * 0.01
+    estimated_saved_cost = saved_verifier_calls * JUDGE_COST_PER_CALL_USD
+    projected_saved_calls = round(
+        saved_verifier_calls
+        / max(runs[-1].reward_rows_total if runs else 1, 1)
+        * REFERENCE_SCALE_TRAJECTORIES
+    )
+    projected_saved_cost = projected_saved_calls * JUDGE_COST_PER_CALL_USD
     speedup = 0.0
     if len(runs) >= 2 and runs[1].duration_ms > 0:
         speedup = runs[0].duration_ms / runs[1].duration_ms
+    noop_run = _find_run(runs, "noop")
+    code_change_run = _find_run(runs, "code-change")
+    noop_stage_calls = sum(noop_run.stage_calls.values()) if noop_run is not None else 0
+    code_change_judge_calls = (
+        code_change_run.stage_calls.get("verifier", 0)
+        if code_change_run is not None
+        else 0
+    )
+    code_change_reward_calls = (
+        code_change_run.stage_calls.get("reward", 0)
+        if code_change_run is not None
+        else 0
+    )
     actual_stage_calls = {
         stage: sum(run.stage_calls.get(stage, 0) for run in runs)
         for stage in ("parse", "features", "verifier", "reward")
@@ -1500,6 +1587,7 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
     .metric-card {{ min-height: 122px; border-radius: 16px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; }}
     .metric-card b {{ font-size: 34px; line-height: 1; }}
     .metric-card span {{ color: var(--muted); font-size: 13px; font-weight: 700; }}
+    .metric-card small {{ color: var(--muted); font-size: 11px; line-height: 1.3; }}
     .section {{ border-radius: 18px; padding: 22px; margin-top: 18px; }}
     .section-head {{ display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 18px; }}
     .section-head p {{ max-width: 660px; margin: 6px 0 0; color: var(--muted); }}
@@ -1552,11 +1640,14 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
     .bar-track {{ height: 12px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
     .bar-fill {{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--teal), var(--green)); }}
     .audit-list {{ display: grid; gap: 10px; margin-top: 14px; }}
-    .audit-row {{ display: grid; grid-template-columns: 1fr 34px 1.2fr; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee8dc; font-size: 13px; }}
+    .audit-row {{ display: grid; grid-template-columns: 1fr 34px 1.1fr 1.1fr 1.2fr; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee8dc; font-size: 13px; }}
     .audit-row:last-child {{ border-bottom: 0; }}
+    .audit-heading {{ color: var(--muted); font-size: 11px; font-weight: 900; text-transform: uppercase; }}
     .audit-row b {{ color: var(--coral); font-variant-numeric: tabular-nums; }}
     .hash {{ display: inline-flex; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 999px; background: #ece7ff; color: #4f3f87; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
     .muted {{ color: var(--muted); }}
+    .sample-card {{ border: 1px solid var(--line); border-radius: 14px; background: #1d1c18; color: #fffdf8; padding: 16px; overflow: auto; }}
+    .sample-card pre {{ margin: 0; min-width: 520px; font-size: 12px; line-height: 1.45; white-space: pre; }}
     .contrast-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
     .contrast-panel {{ border: 1px solid var(--line); border-radius: 14px; background: white; padding: 16px; }}
     .contrast-panel strong {{ display: block; margin-bottom: 10px; }}
@@ -1581,6 +1672,7 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
       .run-kpis {{ grid-column: 1 / -1; justify-content: start; }}
       .panel-head, .section-head {{ align-items: start; flex-direction: column; }}
       .bar-row {{ grid-template-columns: 1fr; gap: 6px; }}
+      .audit-row {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1600,10 +1692,10 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
         </div>
       </section>
       <section class="metric-grid" aria-label="Demo totals">
-        <div class="metric-card"><span>No-op vs backfill</span><b>{speedup:.1f}x</b></div>
-        <div class="metric-card"><span>Judge calls saved vs naive replay</span><b>{saved_verifier_calls}</b></div>
-        <div class="metric-card"><span>Illustrative judge cost avoided</span><b>${estimated_saved_cost:.2f}</b></div>
-        <div class="metric-card"><span>Measured reward calls</span><b>{actual_stage_calls["reward"]}</b></div>
+        <div class="metric-card"><span>No-op vs backfill</span><b>{speedup:.1f}x</b><small>Includes CocoIndex CLI startup; no-op stage calls = {noop_stage_calls}.</small></div>
+        <div class="metric-card"><span>Judge calls saved vs naive replay</span><b>{saved_verifier_calls}</b><small>Naive = every active trajectory reruns on every update.</small></div>
+        <div class="metric-card"><span>Illustrative judge cost avoided</span><b>${estimated_saved_cost:.2f}</b><small>${JUDGE_COST_PER_CALL_USD:.2f}/judge call; 10K-row replay mix ≈ ${projected_saved_cost:,.0f} avoided.</small></div>
+        <div class="metric-card"><span>Measured reward calls</span><b>{actual_stage_calls["reward"]}</b><small>Code-change run: {code_change_judge_calls} judge / {code_change_reward_calls} reward calls.</small></div>
       </section>
     </header>
 
@@ -1643,13 +1735,14 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
       <div class="contrast-grid">
         <div class="contrast-panel">
           <strong>Without maintained reward views</strong>
-          <p>Reward or judge edits trigger coarse replay jobs.</p>
+          <p>Reward or judge edits trigger coarse replay jobs: {naive_verifier_calls} judge calls in this six-update sequence.</p>
           <p>Training JSONL can drift from catalog and diff state.</p>
           <p>Quarantined trajectories can leave stale exported files.</p>
         </div>
         <div class="contrast-panel">
           <strong>With CocoIndex</strong>
-          <p>Function inputs, prompt text, and Python code deps decide what reruns.</p>
+          <p>Actual run: {total_calls} judge calls; no-op: {noop_stage_calls} stage calls.</p>
+          <p>Python reward-code change: {code_change_judge_calls} judge calls, {code_change_reward_calls} reward calls.</p>
           <p>SQLite, JSONL, row files, and reports are declared together.</p>
           <p>Owned target state removes stale training output automatically.</p>
         </div>
@@ -1663,10 +1756,21 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
         <div class="bars">{_render_training_bars(runs)}</div>
       </div>
       <div>
-        <p class="eyebrow">Judge Provenance</p>
-        <h2>LLM judge prompt hashes by run</h2>
-        <div class="audit-list">{_render_verifier_provenance(runs)}</div>
+        <p class="eyebrow">Prompt & Code Provenance</p>
+        <h2>What changed across runs</h2>
+        <div class="audit-list">{_render_prompt_code_provenance(runs)}</div>
       </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Training Row Sample</p>
+          <h2>Reward metadata travels with the trainer-ready JSONL</h2>
+          <p>The export keeps the OpenAI-style messages field next to reward, label, reward-code version, model version, prompt template, and train-step provenance.</p>
+        </div>
+      </div>
+      <div class="sample-card"><pre>{_h(training_sample_json)}</pre></div>
     </section>
 
     <section class="section">
@@ -1703,7 +1807,10 @@ def _write_demo_artifacts(runs: Sequence[DemoRun]) -> None:
         json.dumps([_demo_run_to_dict(run) for run in runs], indent=2) + "\n",
         encoding="utf-8",
     )
-    DASHBOARD_PATH.write_text(_render_dashboard(runs), encoding="utf-8")
+    DASHBOARD_PATH.write_text(
+        _render_dashboard(runs, _training_row_sample_json()),
+        encoding="utf-8",
+    )
 
 
 def _run_demo() -> None:

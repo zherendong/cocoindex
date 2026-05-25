@@ -207,6 +207,8 @@ class DemoRun:
     training_total: int
     changed_labels: int
     reward_version: str
+    pass_threshold: float
+    training_threshold: float
     reward_logic_versions: list[str]
     prompt_template_versions: list[str]
     stage_calls: dict[str, int]
@@ -1180,6 +1182,7 @@ def _run_update_step(run_id: str, title: str, description: str) -> DemoRun:
     before_audit = _read_verifier_audit_records()
     before_stage = _read_stage_audit_records()
 
+    active_policy = _load_policy(POLICY_PATH)
     start = time.perf_counter()
     _run_cocoindex_update(run_id)
     duration_ms = int((time.perf_counter() - start) * 1000)
@@ -1225,6 +1228,8 @@ def _run_update_step(run_id: str, title: str, description: str) -> DemoRun:
         training_total=len(after_training),
         changed_labels=changed_labels,
         reward_version=_active_reward_version(after_rows),
+        pass_threshold=active_policy.pass_threshold,
+        training_threshold=active_policy.training_threshold,
         reward_logic_versions=_row_values(after_rows, "reward_logic_version"),
         prompt_template_versions=_row_values(after_rows, "prompt_template_version"),
         stage_calls=_stage_call_counts(new_stage_records),
@@ -1272,6 +1277,8 @@ def _demo_run_to_dict(run: DemoRun) -> dict[str, object]:
         "training_total": run.training_total,
         "changed_labels": run.changed_labels,
         "reward_version": run.reward_version,
+        "pass_threshold": run.pass_threshold,
+        "training_threshold": run.training_threshold,
         "reward_logic_versions": run.reward_logic_versions,
         "prompt_template_versions": run.prompt_template_versions,
         "stage_calls": run.stage_calls,
@@ -1311,7 +1318,8 @@ def _render_run_card(run: DemoRun, index: int, max_duration_ms: int) -> str:
         <span class="run-copy">
           <strong>{_h(run.title)}</strong>
           <small>{_h(run.description)}</small>
-          <span class="duration-mini"><span style="width:{duration_width}%"></span></span>
+          <span class="duration-caption">Duration vs slowest run</span>
+          <span class="duration-mini" title="Duration relative to the slowest run in this demo"><span style="width:{duration_width}%"></span></span>
         </span>
         <span class="run-kpis">
           <span><b>{run.duration_ms}</b> ms</span>
@@ -1365,6 +1373,7 @@ def _render_status_table(run: DemoRun) -> str:
             </tbody>
           </table>
         </div>
+        <p class="threshold-note">Score thresholds for <b>{_h(run.reward_version)}</b>: pass ≥ {run.pass_threshold:.2f} · training ≥ {run.training_threshold:.2f}.</p>
       </div>
     """
 
@@ -1404,6 +1413,28 @@ def _heatmap_state(status: DemoTrajectoryStatus | None) -> str:
     ):
         return "partial"
     return "none"
+
+
+_TASK_FAMILY_LABELS: Mapping[str, str] = {
+    "capital": "capital (memory QA)",
+    "math": "math (calculator)",
+    "overlong": "overlong (multi-step browser)",
+    "refund": "refund (support)",
+    "sla": "sla (support browser)",
+    "sql": "sql (analytics)",
+    "weather": "weather (browser)",
+}
+
+
+def _task_caption(trajectory_ids: Sequence[str]) -> str:
+    families: list[str] = []
+    for trajectory_id in trajectory_ids:
+        short = _short_trajectory_id(trajectory_id)
+        family = short.split("_", 1)[0]
+        label = _TASK_FAMILY_LABELS.get(family, family)
+        if label not in families:
+            families.append(label)
+    return " · ".join(families)
 
 
 def _render_delta_heatmap(runs: Sequence[DemoRun]) -> str:
@@ -1449,6 +1480,7 @@ def _render_delta_heatmap(runs: Sequence[DemoRun]) -> str:
           {header_cells}
           {"".join(rows)}
         </div>
+        <p class="heatmap-caption"><b>Trajectories:</b> {_h(_task_caption(trajectory_ids))}</p>
         <div class="heatmap-legend">
           <span><i class="none"></i>No work</span>
           <span><i class="partial"></i>Partial replay</span>
@@ -1706,8 +1738,9 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .run-index {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: #1d1c18; color: white; font-weight: 900; }}
     .run-copy strong {{ display: block; font-size: 16px; }}
     .run-copy small {{ display: block; color: var(--muted); margin-top: 3px; font-size: 13px; }}
-    .duration-mini {{ display: block; width: min(360px, 100%); height: 8px; margin-top: 10px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
-    .duration-mini span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--teal), var(--coral)); }}
+    .duration-caption {{ display: block; margin-top: 10px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }}
+    .duration-mini {{ display: block; width: min(360px, 100%); height: 6px; margin-top: 4px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
+    .duration-mini span {{ display: block; height: 100%; border-radius: inherit; background: var(--teal); opacity: 0.55; }}
     .run-kpis {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: end; }}
     .run-kpis span {{ background: var(--wash); border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; font-size: 12px; color: var(--muted); }}
     .run-kpis b {{ color: var(--ink); }}
@@ -1725,6 +1758,17 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .pill.updated {{ color: #805812; background: #fff0c7; border-color: #efd38b; }}
     .pill.removed {{ color: #9c3422; background: #ffe0d8; border-color: #f2b7a8; }}
     .pill.neutral {{ color: #4f3f87; background: #ece7ff; border-color: #d3c8fb; }}
+    .pill-legend {{ display: flex; flex-wrap: wrap; gap: 14px; align-items: center; border: 1px solid var(--line); border-radius: 14px; background: white; padding: 12px 14px; margin: 0 0 18px; font-size: 12px; color: var(--muted); }}
+    .pill-legend b {{ color: var(--ink); margin-right: 4px; }}
+    .pill-legend span {{ display: inline-flex; align-items: center; gap: 6px; }}
+    .pill-legend small {{ color: var(--muted); }}
+    .pill-legend i {{ display: inline-block; width: 14px; height: 14px; border-radius: 5px; border: 1px solid transparent; }}
+    .pill-legend i.created {{ background: #e5f3e5; border-color: #bddfbe; }}
+    .pill-legend i.updated {{ background: #fff0c7; border-color: #efd38b; }}
+    .pill-legend i.removed {{ background: #ffe0d8; border-color: #f2b7a8; }}
+    .pill-legend i.quiet {{ background: #eeebe4; border-color: #ded8cc; }}
+    .threshold-note {{ margin: 10px 2px 0; color: var(--muted); font-size: 12px; }}
+    .threshold-note b {{ color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 800; }}
     .label-badge {{ font-weight: 900; }}
     .label-badge.pass {{ color: var(--green); }}
     .label-badge.fail {{ color: var(--coral); }}
@@ -1740,7 +1784,9 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .heatmap-cell.reward-only {{ background: #ffe2bb; border-color: #f0be75; }}
     .heatmap-cell.judge-reward {{ background: #d99632; border-color: #bf7a16; }}
     .heatmap-cell.full {{ background: #dff2e2; border-color: #bddfbe; }}
-    .heatmap-legend {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .heatmap-caption {{ margin: 12px 0 0; color: var(--muted); font-size: 12px; }}
+    .heatmap-caption b {{ color: var(--ink); }}
+    .heatmap-legend {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; color: var(--muted); font-size: 12px; font-weight: 800; }}
     .heatmap-legend span {{ display: inline-flex; gap: 6px; align-items: center; }}
     .heatmap-legend i {{ width: 14px; height: 14px; border-radius: 5px; border: 1px solid var(--line); }}
     .heatmap-legend i.none {{ background: #eeebe4; }}
@@ -1827,6 +1873,13 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         </div>
       </div>
       {heatmap}
+      <div class="pill-legend" aria-label="Status pill legend">
+        <b>Pill colors:</b>
+        <span><i class="created"></i> work happened <small>(ran, computed, inserted, created)</small></span>
+        <span><i class="updated"></i> output changed <small>(reran, recomputed, updated, edited)</small></span>
+        <span><i class="removed"></i> output removed <small>(removed, deleted)</small></span>
+        <span><i class="quiet"></i> unchanged <small>(cached, same, kept, none)</small></span>
+      </div>
       <div class="run-stack-list">{run_sections}</div>
     </section>
 

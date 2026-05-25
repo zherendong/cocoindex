@@ -9,11 +9,28 @@
   "observations": [
     "calculator returned 42"
   ],
+  "tool_calls": [
+    {
+      "name": "calculator",
+      "args": {
+        "expression": "6 * 7"
+      },
+      "result": {
+        "value": 42
+      },
+      "latency_ms": 18
+    }
+  ],
   "final_answer": "42",
   "ground_truth": "42",
   "metadata": {
     "model": "agent-alpha",
+    "model_version": "agent-alpha-rft-2026-05-10",
     "environment": "math-mini",
+    "sample_temperature": 0.2,
+    "train_step": 18400,
+    "prompt_template_version": "math-tool-v3",
+    "token_count": 146,
     "baseline_label": "fail"
   },
   "quarantined": false

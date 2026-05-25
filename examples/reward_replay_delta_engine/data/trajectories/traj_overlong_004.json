@@ -15,11 +15,58 @@
     "The Eiffel Tower is located in Paris, France.",
     "Paris has many well-known landmarks."
   ],
+  "tool_calls": [
+    {
+      "name": "search",
+      "args": {
+        "query": "Eiffel Tower location"
+      },
+      "result": {
+        "snippet": "The Eiffel Tower is located in Paris, France."
+      },
+      "latency_ms": 428
+    },
+    {
+      "name": "open",
+      "args": {
+        "url": "https://landmarks.example/eiffel-tower"
+      },
+      "result": {
+        "status": 200
+      },
+      "latency_ms": 201
+    },
+    {
+      "name": "search",
+      "args": {
+        "query": "Paris landmarks"
+      },
+      "result": {
+        "snippet": "Paris has many well-known landmarks."
+      },
+      "latency_ms": 390
+    },
+    {
+      "name": "open",
+      "args": {
+        "url": "https://travel.example/paris"
+      },
+      "result": {
+        "status": 200
+      },
+      "latency_ms": 188
+    }
+  ],
   "final_answer": "Paris",
   "ground_truth": "Paris",
   "metadata": {
     "model": "agent-beta",
+    "model_version": "agent-beta-rft-2026-05-12",
     "environment": "browser-mini",
+    "sample_temperature": 0.8,
+    "train_step": 19120,
+    "prompt_template_version": "browser-rubric-v5",
+    "token_count": 1248,
     "baseline_label": "pass"
   },
   "quarantined": false

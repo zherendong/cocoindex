@@ -7,9 +7,11 @@ import datetime
 import hashlib
 import html
 import json
+import os
 import pathlib
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -17,22 +19,28 @@ from dataclasses import dataclass
 from typing import cast
 
 import cocoindex as coco
+import reward_logic as _reward_logic
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parents[1]
+PYTHON_SOURCE_DIR = REPO_ROOT / "python"
 DATA_DIR = BASE_DIR / "data"
 TRAJECTORY_DIR = DATA_DIR / "trajectories"
 SEED_TRAJECTORY_DIR = DATA_DIR / "seed_trajectories"
 SCENARIO_TRAJECTORY_DIR = DATA_DIR / "scenario_trajectories"
 POLICY_DIR = DATA_DIR / "policies"
 POLICY_PATH = BASE_DIR / "reward_policy.json"
+REWARD_LOGIC_PATH = BASE_DIR / "reward_logic.py"
+REWARD_LOGIC_VARIANTS_DIR = DATA_DIR / "reward_logic_variants"
 OUTPUT_DIR = BASE_DIR / "output"
 COCOINDEX_STATE_DIR = BASE_DIR / ".cocoindex"
 COCOINDEX_DB_PATH = COCOINDEX_STATE_DIR / "reward_replay"
 REWARD_DB_PATH = OUTPUT_DIR / "reward_catalog.sqlite"
 VERIFIER_AUDIT_PATH = OUTPUT_DIR / "verifier_calls.jsonl"
+STAGE_AUDIT_PATH = OUTPUT_DIR / "stage_calls.jsonl"
 DEMO_RUNS_PATH = OUTPUT_DIR / "demo_runs.json"
 DASHBOARD_PATH = OUTPUT_DIR / "dashboard.html"
 
@@ -49,6 +57,7 @@ _TOOL_ACTION_PREFIXES = (
     "sql:",
     "tool:",
 )
+_ACTIVE_DEMO_RUN_ID: str | None = os.environ.get("REWARD_REPLAY_DEMO_RUN_ID")
 
 
 @dataclass(frozen=True)
@@ -58,10 +67,16 @@ class Trajectory:
     prompt: str
     actions: list[str]
     observations: list[str]
+    tool_calls: list[dict[str, object]]
     final_answer: str
     ground_truth: str
     model: str
+    model_version: str
     environment: str
+    sample_temperature: float
+    train_step: int
+    prompt_template_version: str
+    token_count: int
     baseline_label: str
     quarantined: bool
 
@@ -113,6 +128,7 @@ class RewardRow:
     trajectory_id: str
     task_id: str
     reward_version: str
+    reward_logic_version: str
     baseline_reward_version: str
     baseline_label: str
     label: str
@@ -122,7 +138,9 @@ class RewardRow:
     verifier_confidence: float
     changed_from_baseline: bool
     model: str
+    model_version: str
     environment: str
+    train_step: int
     action_count: int
     tool_action_count: int
     quarantined: bool
@@ -159,6 +177,7 @@ class DemoTrajectoryStatus:
     trajectory_id: str
     source: str
     parser: str
+    features: str
     verifier: str
     reward: str
     catalog: str
@@ -185,6 +204,8 @@ class DemoRun:
     training_total: int
     changed_labels: int
     reward_version: str
+    stage_calls: dict[str, int]
+    prompt_hashes: list[str]
     statuses: list[DemoTrajectoryStatus]
 
 
@@ -236,6 +257,15 @@ def _required_str_list(data: Mapping[str, object], key: str) -> list[str]:
     return list(value)
 
 
+def _optional_mapping_list(
+    data: Mapping[str, object], key: str
+) -> list[dict[str, object]]:
+    value = data.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"Expected list[object] field {key!r}")
+    return [dict(cast(Mapping[str, object], item)) for item in value]
+
+
 def _required_float(data: Mapping[str, object], key: str) -> float:
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, (float, int)):
@@ -257,6 +287,27 @@ def _optional_bool(data: Mapping[str, object], key: str, default: bool) -> bool:
     return value
 
 
+def _optional_str(data: Mapping[str, object], key: str, default: str) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str):
+        raise ValueError(f"Expected string field {key!r}")
+    return value
+
+
+def _optional_float(data: Mapping[str, object], key: str, default: float) -> float:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (float, int)):
+        raise ValueError(f"Expected numeric field {key!r}")
+    return float(value)
+
+
+def _optional_int(data: Mapping[str, object], key: str, default: int) -> int:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Expected integer field {key!r}")
+    return value
+
+
 def _load_policy(policy_path: pathlib.Path) -> RewardPolicy:
     data = _read_json(policy_path)
     return RewardPolicy(
@@ -274,6 +325,10 @@ def _load_policy(policy_path: pathlib.Path) -> RewardPolicy:
     )
 
 
+def _reward_logic_source() -> str:
+    return REWARD_LOGIC_PATH.read_text(encoding="utf-8")
+
+
 def _load_trajectory(data: Mapping[str, object]) -> Trajectory:
     metadata = _required_mapping(data, "metadata")
     return Trajectory(
@@ -282,10 +337,18 @@ def _load_trajectory(data: Mapping[str, object]) -> Trajectory:
         prompt=_required_str(data, "prompt"),
         actions=_required_str_list(data, "actions"),
         observations=_required_str_list(data, "observations"),
+        tool_calls=_optional_mapping_list(data, "tool_calls"),
         final_answer=_required_str(data, "final_answer"),
         ground_truth=_required_str(data, "ground_truth"),
         model=_required_str(metadata, "model"),
+        model_version=_optional_str(metadata, "model_version", "unknown"),
         environment=_required_str(metadata, "environment"),
+        sample_temperature=_optional_float(metadata, "sample_temperature", 0.0),
+        train_step=_optional_int(metadata, "train_step", 0),
+        prompt_template_version=_optional_str(
+            metadata, "prompt_template_version", "unknown"
+        ),
+        token_count=_optional_int(metadata, "token_count", 0),
         baseline_label=_required_str(metadata, "baseline_label"),
         quarantined=_optional_bool(data, "quarantined", False),
     )
@@ -327,25 +390,46 @@ def _append_jsonl(path: pathlib.Path, record: Mapping[str, object]) -> None:
         f.write("\n")
 
 
+def _append_stage_audit(stage: str, trajectory_id: str) -> None:
+    if _ACTIVE_DEMO_RUN_ID is None:
+        return
+    _append_jsonl(
+        STAGE_AUDIT_PATH,
+        {
+            "at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "run_id": _ACTIVE_DEMO_RUN_ID,
+            "stage": stage,
+            "trajectory_id": trajectory_id,
+        },
+    )
+
+
 @coco.fn(memo=True)
 async def parse_trajectory(file: FileLike[pathlib.Path]) -> Trajectory:
-    return _load_trajectory(
+    trajectory = _load_trajectory(
         _json_object_from_text(
             await file.read_text(),
             file.file_path.path.as_posix(),
         )
     )
+    _append_stage_audit("parse", trajectory.trajectory_id)
+    return trajectory
 
 
 @coco.fn(memo=True)
 def extract_features(trajectory: Trajectory) -> RewardFeatures:
+    _append_stage_audit("features", trajectory.trajectory_id)
     normalized_answer = _normalize_answer(trajectory.final_answer)
     normalized_truth = _normalize_answer(trajectory.ground_truth)
     answer_contains_ground_truth = bool(normalized_truth) and (
         normalized_truth in normalized_answer
     )
     action_count = len(trajectory.actions)
-    tool_action_count = _count_tool_actions(trajectory.actions)
+    tool_action_count = (
+        len(trajectory.tool_calls)
+        if trajectory.tool_calls
+        else _count_tool_actions(trajectory.actions)
+    )
     return RewardFeatures(
         trajectory_id=trajectory.trajectory_id,
         action_count=action_count,
@@ -357,7 +441,8 @@ def extract_features(trajectory: Trajectory) -> RewardFeatures:
         ),
         trace_summary=(
             f"{trajectory.task_id}: {action_count} actions, "
-            f"{tool_action_count} tool actions, final={trajectory.final_answer!r}"
+            f"{tool_action_count} tool calls, model={trajectory.model_version}, "
+            f"step={trajectory.train_step}, final={trajectory.final_answer!r}"
         ),
     )
 
@@ -368,6 +453,7 @@ async def run_verifier(
     verifier_prompt: str,
     audit_path: pathlib.Path,
 ) -> VerifierLabel:
+    _append_stage_audit("verifier", features.trajectory_id)
     await asyncio.sleep(0.25)
     prompt_hash = hashlib.sha256(verifier_prompt.encode()).hexdigest()[:10]
     strict = "strict" in verifier_prompt.lower()
@@ -394,6 +480,7 @@ async def run_verifier(
         audit_path,
         {
             "at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "run_id": _ACTIVE_DEMO_RUN_ID,
             "trajectory_id": features.trajectory_id,
             "prompt_hash": prompt_hash,
             "label": label,
@@ -407,13 +494,14 @@ async def run_verifier(
     )
 
 
-@coco.fn(memo=True)
+@coco.fn(memo=True, deps={"reward_logic.py": _reward_logic_source()})
 def score_reward(
     trajectory: Trajectory,
     features: RewardFeatures,
     verifier: VerifierLabel,
     policy: RewardPolicy,
 ) -> RewardDecision:
+    _append_stage_audit("reward", trajectory.trajectory_id)
     if trajectory.quarantined:
         return RewardDecision(
             label="fail",
@@ -443,15 +531,23 @@ def score_reward(
 
     extra_actions = max(0, features.action_count - policy.max_actions)
     score -= extra_actions * policy.extra_action_penalty
+    score, code_reason = _reward_logic.adjust_score(
+        score,
+        answer_exact=features.answer_exact,
+        answer_contains_ground_truth=features.answer_contains_ground_truth,
+        action_count=features.action_count,
+        tool_action_count=features.tool_action_count,
+    )
     score = round(min(1.0, max(0.0, score)), 3)
 
     label = "pass" if score >= policy.pass_threshold else "fail"
     include_in_training = label == "pass" and score >= policy.training_threshold
-    training_reason = (
+    base_training_reason = (
         "eligible for training export"
         if include_in_training
         else f"below training threshold {policy.training_threshold:.2f}"
     )
+    training_reason = f"{base_training_reason}; reward logic: {code_reason}"
     return RewardDecision(
         label=label,
         score=score,
@@ -470,10 +566,21 @@ def _training_record_json(
             "trajectory_id": trajectory.trajectory_id,
             "task_id": trajectory.task_id,
             "reward_version": policy.reward_version,
+            "reward_logic_version": _reward_logic.REWARD_LOGIC_VERSION,
             "messages": [
                 {"role": "user", "content": trajectory.prompt},
                 {"role": "assistant", "content": trajectory.final_answer},
             ],
+            "tool_calls": trajectory.tool_calls,
+            "metadata": {
+                "model": trajectory.model,
+                "model_version": trajectory.model_version,
+                "environment": trajectory.environment,
+                "sample_temperature": trajectory.sample_temperature,
+                "train_step": trajectory.train_step,
+                "prompt_template_version": trajectory.prompt_template_version,
+                "token_count": trajectory.token_count,
+            },
             "reward": decision.score,
             "label": decision.label,
         },
@@ -504,6 +611,7 @@ async def process_trajectory(
             trajectory_id=trajectory.trajectory_id,
             task_id=trajectory.task_id,
             reward_version=policy.reward_version,
+            reward_logic_version=_reward_logic.REWARD_LOGIC_VERSION,
             baseline_reward_version=policy.baseline_reward_version,
             baseline_label=trajectory.baseline_label,
             label=decision.label,
@@ -513,7 +621,9 @@ async def process_trajectory(
             verifier_confidence=verifier.confidence,
             changed_from_baseline=changed_from_baseline,
             model=trajectory.model,
+            model_version=trajectory.model_version,
             environment=trajectory.environment,
+            train_step=trajectory.train_step,
             action_count=features.action_count,
             tool_action_count=features.tool_action_count,
             quarantined=trajectory.quarantined,
@@ -708,6 +818,7 @@ def _copytree_contents(source: pathlib.Path, destination: pathlib.Path) -> None:
 def _restore_seed_inputs() -> None:
     _copytree_contents(SEED_TRAJECTORY_DIR, TRAJECTORY_DIR)
     shutil.copy2(POLICY_DIR / "balanced.json", POLICY_PATH)
+    shutil.copy2(REWARD_LOGIC_VARIANTS_DIR / "base.py", REWARD_LOGIC_PATH)
 
 
 def _reset_demo(*, announce: bool = True) -> None:
@@ -736,6 +847,17 @@ def _set_policy(name: str, *, announce: bool = True) -> None:
     shutil.copy2(policy_path, POLICY_PATH)
     if announce:
         print(f"Set reward policy to {name}.")
+
+
+def _set_reward_logic(name: str, *, announce: bool = True) -> None:
+    logic_path = REWARD_LOGIC_VARIANTS_DIR / f"{name}.py"
+    if not logic_path.exists():
+        raise ValueError(
+            f"Unknown reward logic {name!r}; expected one of: base, tool_trace_bonus"
+        )
+    shutil.copy2(logic_path, REWARD_LOGIC_PATH)
+    if announce:
+        print(f"Set reward logic to {name}.")
 
 
 def _set_quarantine(
@@ -790,7 +912,7 @@ def _show_outputs() -> None:
         print(report_path.read_text(encoding="utf-8").rstrip())
         print()
     _print_sqlite_summary()
-    print(f"Verifier calls recorded: {_read_verifier_call_count()}")
+    print(f"Judge calls recorded: {_read_verifier_call_count()}")
     training_path = OUTPUT_DIR / "training.jsonl"
     if training_path.exists():
         print(f"Training export: {training_path.relative_to(BASE_DIR)}")
@@ -814,7 +936,7 @@ def _reward_row_snapshot() -> dict[str, dict[str, object]]:
         rows = conn.execute(
             """
             SELECT trajectory_id, label, score, include_in_training,
-                   changed_from_baseline, reward_version
+                   changed_from_baseline, reward_version, reward_logic_version
             FROM reward_rows
             ORDER BY trajectory_id
             """
@@ -843,6 +965,72 @@ def _read_verifier_audit_records() -> list[Mapping[str, object]]:
             if isinstance(record, dict):
                 records.append(cast(Mapping[str, object], record))
     return records
+
+
+def _read_stage_audit_records() -> list[Mapping[str, object]]:
+    if not STAGE_AUDIT_PATH.exists():
+        return []
+    records: list[Mapping[str, object]] = []
+    with STAGE_AUDIT_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(cast(Mapping[str, object], record))
+    return records
+
+
+def _stage_trajectory_ids(
+    records: Sequence[Mapping[str, object]], stage: str
+) -> set[str]:
+    return {
+        str(record["trajectory_id"])
+        for record in records
+        if record.get("stage") == stage and isinstance(record.get("trajectory_id"), str)
+    }
+
+
+def _stage_call_counts(records: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {"parse": 0, "features": 0, "verifier": 0, "reward": 0}
+    for record in records:
+        stage = record.get("stage")
+        if isinstance(stage, str):
+            counts[stage] = counts.get(stage, 0) + 1
+    return counts
+
+
+def _prompt_hashes(records: Sequence[Mapping[str, object]]) -> list[str]:
+    return sorted(
+        {
+            str(record["prompt_hash"])
+            for record in records
+            if isinstance(record.get("prompt_hash"), str)
+        }
+    )
+
+
+def _run_cocoindex_update(run_id: str) -> None:
+    env = os.environ.copy()
+    env["REWARD_REPLAY_DEMO_RUN_ID"] = run_id
+    existing_pythonpath = env.get("PYTHONPATH")
+    pythonpath_parts = [str(PYTHON_SOURCE_DIR)]
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cocoindex.cli",
+            "update",
+            "-q",
+            "main.py",
+        ],
+        cwd=BASE_DIR,
+        env=env,
+        check=True,
+    )
 
 
 def _active_reward_version(rows: Mapping[str, Mapping[str, object]]) -> str:
@@ -879,32 +1067,34 @@ def _training_status(trajectory_id: str, before: set[str], after: set[str]) -> s
     return "none"
 
 
-def _source_status(run_id: str, trajectory_id: str, created: bool) -> str:
-    if run_id == "backfill" or created:
+def _source_status(trajectory_id: str, created: bool, parse_ids: set[str]) -> str:
+    if created:
         return "new"
-    if run_id == "strict-policy":
-        return "same"
-    if run_id == "quarantine" and trajectory_id == "traj_weather_002":
+    if trajectory_id in parse_ids:
         return "edited"
     return "same"
 
 
-def _parser_status(run_id: str, trajectory_id: str, created: bool) -> str:
-    if run_id == "backfill" or created:
-        return "ran"
-    if run_id == "quarantine" and trajectory_id == "traj_weather_002":
+def _stage_status(trajectory_id: str, stage_ids: set[str]) -> str:
+    if trajectory_id in stage_ids:
         return "ran"
     return "cached"
 
 
-def _reward_status(run_id: str, created: bool, row_changed: bool) -> str:
-    if run_id == "backfill" or created:
+def _reward_status(trajectory_id: str, created: bool, reward_ids: set[str]) -> str:
+    if trajectory_id not in reward_ids:
+        return "cached"
+    if created:
         return "computed"
-    if run_id == "strict-policy":
-        return "recomputed"
-    if row_changed:
-        return "updated"
-    return "cached"
+    return "recomputed"
+
+
+def _verifier_status(trajectory_id: str, created: bool, verifier_ids: set[str]) -> str:
+    if trajectory_id not in verifier_ids:
+        return "cached"
+    if created:
+        return "computed"
+    return "reran"
 
 
 def _catalog_status(created: bool, removed: bool, row_changed: bool) -> str:
@@ -918,19 +1108,25 @@ def _catalog_status(created: bool, removed: bool, row_changed: bool) -> str:
 
 
 def _build_trajectory_statuses(
-    run_id: str,
     before_rows: Mapping[str, Mapping[str, object]],
     after_rows: Mapping[str, Mapping[str, object]],
     before_training: set[str],
     after_training: set[str],
-    verifier_trajectory_ids: set[str],
+    stage_records: Sequence[Mapping[str, object]],
 ) -> list[DemoTrajectoryStatus]:
+    parse_ids = _stage_trajectory_ids(stage_records, "parse")
+    features_ids = _stage_trajectory_ids(stage_records, "features")
+    verifier_ids = _stage_trajectory_ids(stage_records, "verifier")
+    reward_ids = _stage_trajectory_ids(stage_records, "reward")
     all_ids = sorted(
         set(before_rows)
         | set(after_rows)
         | before_training
         | after_training
-        | verifier_trajectory_ids
+        | parse_ids
+        | features_ids
+        | verifier_ids
+        | reward_ids
     )
     statuses: list[DemoTrajectoryStatus] = []
     for trajectory_id in all_ids:
@@ -939,14 +1135,14 @@ def _build_trajectory_statuses(
         created = before_row is None and after_row is not None
         removed = before_row is not None and after_row is None
         row_changed = before_row != after_row
-        verifier = "reran" if trajectory_id in verifier_trajectory_ids else "cached"
         statuses.append(
             DemoTrajectoryStatus(
                 trajectory_id=trajectory_id,
-                source=_source_status(run_id, trajectory_id, created),
-                parser=_parser_status(run_id, trajectory_id, created),
-                verifier=verifier,
-                reward=_reward_status(run_id, created, row_changed),
+                source=_source_status(trajectory_id, created, parse_ids),
+                parser=_stage_status(trajectory_id, parse_ids),
+                features=_stage_status(trajectory_id, features_ids),
+                verifier=_verifier_status(trajectory_id, created, verifier_ids),
+                reward=_reward_status(trajectory_id, created, reward_ids),
                 catalog=_catalog_status(created, removed, row_changed),
                 training=_training_status(
                     trajectory_id, before_training, after_training
@@ -962,20 +1158,18 @@ def _run_update_step(run_id: str, title: str, description: str) -> DemoRun:
     before_rows = _reward_row_snapshot()
     before_training = _training_snapshot()
     before_audit = _read_verifier_audit_records()
+    before_stage = _read_stage_audit_records()
 
     start = time.perf_counter()
-    app.update_blocking()
+    _run_cocoindex_update(run_id)
     duration_ms = int((time.perf_counter() - start) * 1000)
 
     after_rows = _reward_row_snapshot()
     after_training = _training_snapshot()
     after_audit = _read_verifier_audit_records()
+    after_stage = _read_stage_audit_records()
     new_audit_records = after_audit[len(before_audit) :]
-    verifier_trajectory_ids = {
-        str(record["trajectory_id"])
-        for record in new_audit_records
-        if isinstance(record.get("trajectory_id"), str)
-    }
+    new_stage_records = after_stage[len(before_stage) :]
 
     before_ids = set(before_rows)
     after_ids = set(after_rows)
@@ -1011,13 +1205,14 @@ def _run_update_step(run_id: str, title: str, description: str) -> DemoRun:
         training_total=len(after_training),
         changed_labels=changed_labels,
         reward_version=_active_reward_version(after_rows),
+        stage_calls=_stage_call_counts(new_stage_records),
+        prompt_hashes=_prompt_hashes(new_audit_records),
         statuses=_build_trajectory_statuses(
-            run_id,
             before_rows,
             after_rows,
             before_training,
             after_training,
-            verifier_trajectory_ids,
+            new_stage_records,
         ),
     )
 
@@ -1027,6 +1222,7 @@ def _demo_status_to_dict(status: DemoTrajectoryStatus) -> dict[str, object]:
         "trajectory_id": status.trajectory_id,
         "source": status.source,
         "parser": status.parser,
+        "features": status.features,
         "verifier": status.verifier,
         "reward": status.reward,
         "catalog": status.catalog,
@@ -1054,6 +1250,8 @@ def _demo_run_to_dict(run: DemoRun) -> dict[str, object]:
         "training_total": run.training_total,
         "changed_labels": run.changed_labels,
         "reward_version": run.reward_version,
+        "stage_calls": run.stage_calls,
+        "prompt_hashes": run.prompt_hashes,
         "statuses": [_demo_status_to_dict(status) for status in run.statuses],
     }
 
@@ -1078,17 +1276,24 @@ def _render_status_pill(value: str) -> str:
     return f'<span class="pill {_status_class(value)}">{_h(value)}</span>'
 
 
-def _render_run_card(run: DemoRun, index: int) -> str:
+def _render_run_card(run: DemoRun, index: int, max_duration_ms: int) -> str:
+    duration_width = max(4, int(run.duration_ms / max(max_duration_ms, 1) * 100))
+    changed_rows = (
+        run.reward_rows_changed + run.reward_rows_added + run.reward_rows_removed
+    )
     return f"""
       <button class="run-card{" is-active" if index == 0 else ""}" data-run-tab="{_h(run.run_id)}">
         <span class="run-index">{index + 1:02d}</span>
         <span class="run-copy">
           <strong>{_h(run.title)}</strong>
           <small>{_h(run.description)}</small>
+          <span class="duration-mini"><span style="width:{duration_width}%"></span></span>
         </span>
         <span class="run-kpis">
-          <span><b>{run.verifier_calls_added}</b> verifier calls</span>
-          <span><b>{run.reward_rows_changed + run.reward_rows_added + run.reward_rows_removed}</b> catalog deltas</span>
+          <span><b>{run.duration_ms}</b> ms</span>
+          <span><b>{run.verifier_calls_added}</b> judge calls</span>
+          <span><b>{run.stage_calls.get("reward", 0)}</b> reward calls</span>
+          <span><b>{changed_rows}</b> row updates</span>
         </span>
       </button>
     """
@@ -1104,6 +1309,7 @@ def _render_status_table(run: DemoRun, active: bool) -> str:
               <td class="mono">{_h(status.trajectory_id)}</td>
               <td>{_render_status_pill(status.source)}</td>
               <td>{_render_status_pill(status.parser)}</td>
+              <td>{_render_status_pill(status.features)}</td>
               <td>{_render_status_pill(status.verifier)}</td>
               <td>{_render_status_pill(status.reward)}</td>
               <td>{_render_status_pill(status.catalog)}</td>
@@ -1122,7 +1328,10 @@ def _render_status_table(run: DemoRun, active: bool) -> str:
           </div>
           <div class="panel-metrics">
             <span>{run.duration_ms} ms</span>
-            <span>{run.verifier_calls_added} verifier calls</span>
+            <span>{run.stage_calls.get("parse", 0)} parser calls</span>
+            <span>{run.stage_calls.get("verifier", 0)} judge calls</span>
+            <span>{run.stage_calls.get("reward", 0)} reward calls</span>
+            <span>{run.label_flips} run-over-run flips</span>
             <span>{run.training_added} train added / {run.training_removed} removed</span>
           </div>
         </div>
@@ -1133,7 +1342,8 @@ def _render_status_table(run: DemoRun, active: bool) -> str:
                 <th>Trajectory</th>
                 <th>Source</th>
                 <th>Parser</th>
-                <th>Verifier</th>
+                <th>Features</th>
+                <th>Judge</th>
                 <th>Reward</th>
                 <th>Catalog</th>
                 <th>Training</th>
@@ -1168,38 +1378,75 @@ def _render_training_bars(runs: Sequence[DemoRun]) -> str:
     return "".join(bars)
 
 
+def _render_verifier_provenance(runs: Sequence[DemoRun]) -> str:
+    rows = []
+    for run in runs:
+        hashes = (
+            ", ".join(
+                f'<span class="hash">{_h(prompt_hash)}</span>'
+                for prompt_hash in run.prompt_hashes
+            )
+            if run.prompt_hashes
+            else '<span class="muted">cached</span>'
+        )
+        rows.append(
+            f"""
+            <div class="audit-row">
+              <span>{_h(run.title)}</span>
+              <b>{run.verifier_calls_added}</b>
+              <span>{hashes}</span>
+            </div>
+            """
+        )
+    return "".join(rows)
+
+
 def _render_artifact_map() -> str:
     return """
-      <svg class="artifact-map" viewBox="0 0 920 260" role="img" aria-label="Reward replay artifact map">
+      <svg class="artifact-map" viewBox="0 0 960 340" role="img" aria-label="Reward replay artifact map">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z"></path>
           </marker>
         </defs>
-        <g class="node source"><rect x="24" y="72" width="150" height="78" rx="12"></rect><text x="99" y="104">Trajectory</text><text x="99" y="128">JSON</text></g>
-        <g class="node memo"><rect x="236" y="34" width="150" height="70" rx="12"></rect><text x="311" y="66">Parse</text><text x="311" y="88">features</text></g>
-        <g class="node memo"><rect x="236" y="150" width="150" height="70" rx="12"></rect><text x="311" y="180">Verifier</text><text x="311" y="202">cache</text></g>
-        <g class="node reward"><rect x="456" y="72" width="150" height="78" rx="12"></rect><text x="531" y="104">Reward</text><text x="531" y="128">decision</text></g>
-        <g class="node target"><rect x="680" y="20" width="180" height="58" rx="12"></rect><text x="770" y="55">SQLite catalog</text></g>
-        <g class="node target"><rect x="680" y="100" width="180" height="58" rx="12"></rect><text x="770" y="135">Training JSONL</text></g>
-        <g class="node target"><rect x="680" y="180" width="180" height="58" rx="12"></rect><text x="770" y="215">Diff report</text></g>
-        <path class="edge" d="M174 111 C205 111 205 69 236 69"></path>
-        <path class="edge" d="M174 111 C205 111 205 185 236 185"></path>
-        <path class="edge" d="M386 69 C425 69 420 111 456 111"></path>
-        <path class="edge" d="M386 185 C430 185 420 111 456 111"></path>
-        <path class="edge" d="M606 111 C644 111 638 49 680 49"></path>
-        <path class="edge" d="M606 111 C640 111 644 129 680 129"></path>
-        <path class="edge" d="M606 111 C644 111 638 209 680 209"></path>
+        <g class="node source"><rect x="24" y="128" width="154" height="84" rx="12"></rect><text x="101" y="162">Trajectory</text><text x="101" y="186">JSON</text></g>
+        <g class="node memo"><rect x="244" y="54" width="164" height="72" rx="12"></rect><text x="326" y="85">Memoized</text><text x="326" y="107">parse/features</text></g>
+        <g class="node memo"><rect x="244" y="192" width="164" height="72" rx="12"></rect><text x="326" y="223">Memoized</text><text x="326" y="245">LLM judge</text></g>
+        <g class="node reward"><rect x="474" y="128" width="160" height="84" rx="12"></rect><text x="554" y="162">Reward</text><text x="554" y="186">decision</text></g>
+        <g class="node target"><rect x="720" y="18" width="194" height="50" rx="12"></rect><text x="817" y="48">SQLite reward_rows</text></g>
+        <g class="node target"><rect x="720" y="80" width="194" height="50" rx="12"></rect><text x="817" y="110">SQLite reward_diffs</text></g>
+        <g class="node target"><rect x="720" y="142" width="194" height="50" rx="12"></rect><text x="817" y="172">Training JSONL</text></g>
+        <g class="node target"><rect x="720" y="204" width="194" height="50" rx="12"></rect><text x="817" y="234">Owned row files</text></g>
+        <g class="node target"><rect x="720" y="266" width="194" height="50" rx="12"></rect><text x="817" y="296">Judge audit JSONL</text></g>
+        <path class="edge" d="M178 170 C216 170 210 90 244 90"></path>
+        <path class="edge" d="M178 170 C216 170 210 228 244 228"></path>
+        <path class="edge" d="M408 90 C450 90 432 170 474 170"></path>
+        <path class="edge" d="M408 228 C454 228 432 170 474 170"></path>
+        <path class="edge" d="M634 170 C684 170 674 43 720 43"></path>
+        <path class="edge" d="M634 170 C684 170 674 105 720 105"></path>
+        <path class="edge" d="M634 170 C680 170 674 167 720 167"></path>
+        <path class="edge" d="M634 170 C684 170 674 229 720 229"></path>
+        <path class="edge" d="M408 228 C566 228 570 291 720 291"></path>
       </svg>
     """
 
 
 def _render_dashboard(runs: Sequence[DemoRun]) -> str:
     total_calls = runs[-1].total_verifier_calls if runs else 0
-    final_training = runs[-1].training_total if runs else 0
-    final_changed = runs[-1].changed_labels if runs else 0
-    total_duration = sum(run.duration_ms for run in runs)
-    run_cards = "".join(_render_run_card(run, i) for i, run in enumerate(runs))
+    max_duration = max((run.duration_ms for run in runs), default=1)
+    naive_verifier_calls = sum(run.reward_rows_total for run in runs)
+    saved_verifier_calls = max(0, naive_verifier_calls - total_calls)
+    estimated_saved_cost = saved_verifier_calls * 0.01
+    speedup = 0.0
+    if len(runs) >= 2 and runs[1].duration_ms > 0:
+        speedup = runs[0].duration_ms / runs[1].duration_ms
+    actual_stage_calls = {
+        stage: sum(run.stage_calls.get(stage, 0) for run in runs)
+        for stage in ("parse", "features", "verifier", "reward")
+    }
+    run_cards = "".join(
+        _render_run_card(run, i, max_duration) for i, run in enumerate(runs)
+    )
     panels = "".join(_render_status_table(run, i == 0) for i, run in enumerate(runs))
     generated_at = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
@@ -1273,6 +1520,8 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
     .run-index {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: #1d1c18; color: white; font-weight: 900; }}
     .run-copy strong {{ display: block; font-size: 16px; }}
     .run-copy small {{ display: block; color: var(--muted); margin-top: 3px; font-size: 13px; }}
+    .duration-mini {{ display: block; width: min(360px, 100%); height: 8px; margin-top: 10px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
+    .duration-mini span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--teal), var(--coral)); }}
     .run-kpis {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: end; }}
     .run-kpis span {{ background: var(--wash); border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; font-size: 12px; color: var(--muted); }}
     .run-kpis b {{ color: var(--ink); }}
@@ -1302,6 +1551,17 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
     .bar-row {{ display: grid; grid-template-columns: 150px 1fr 30px; gap: 12px; align-items: center; font-size: 13px; }}
     .bar-track {{ height: 12px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
     .bar-fill {{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--teal), var(--green)); }}
+    .audit-list {{ display: grid; gap: 10px; margin-top: 14px; }}
+    .audit-row {{ display: grid; grid-template-columns: 1fr 34px 1.2fr; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee8dc; font-size: 13px; }}
+    .audit-row:last-child {{ border-bottom: 0; }}
+    .audit-row b {{ color: var(--coral); font-variant-numeric: tabular-nums; }}
+    .hash {{ display: inline-flex; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 999px; background: #ece7ff; color: #4f3f87; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
+    .muted {{ color: var(--muted); }}
+    .contrast-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+    .contrast-panel {{ border: 1px solid var(--line); border-radius: 14px; background: white; padding: 16px; }}
+    .contrast-panel strong {{ display: block; margin-bottom: 10px; }}
+    .contrast-panel p {{ margin: 0 0 10px; color: var(--muted); font-size: 14px; }}
+    .contrast-panel p:last-child {{ margin-bottom: 0; }}
     .artifact-map {{ width: 100%; height: auto; margin-top: 8px; }}
     .artifact-map .node rect {{ fill: white; stroke-width: 2; }}
     .artifact-map .source rect {{ stroke: var(--coral); }}
@@ -1316,6 +1576,7 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
       main {{ width: min(100vw - 24px, 1180px); padding-top: 18px; }}
       header, .insight-grid {{ grid-template-columns: 1fr; }}
       .metric-grid {{ grid-template-columns: 1fr 1fr; }}
+      .contrast-grid {{ grid-template-columns: 1fr; }}
       .run-card {{ grid-template-columns: 44px 1fr; }}
       .run-kpis {{ grid-column: 1 / -1; justify-content: start; }}
       .panel-head, .section-head {{ align-items: start; flex-direction: column; }}
@@ -1330,7 +1591,7 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
         <div>
           <p class="eyebrow">CocoIndex RL Control Plane</p>
           <h1>Reward replay becomes a <span>delta update</span>.</h1>
-          <p class="lede">This dashboard was generated from a real demo run. It shows which trajectory artifacts were cached, recomputed, inserted, updated, or removed as reward logic and source data changed.</p>
+          <p class="lede">This dashboard was generated from a real demo run with a simulated LLM judge. Stage calls are measured from memoized function executions, not inferred from labels.</p>
         </div>
         <div class="claim">
           <span>Code-aware invalidation</span>
@@ -1339,10 +1600,10 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
         </div>
       </section>
       <section class="metric-grid" aria-label="Demo totals">
-        <div class="metric-card"><span>Total runtime</span><b>{total_duration} ms</b></div>
-        <div class="metric-card"><span>Verifier calls</span><b>{total_calls}</b></div>
-        <div class="metric-card"><span>Final training rows</span><b>{final_training}</b></div>
-        <div class="metric-card"><span>Changed labels</span><b>{final_changed}</b></div>
+        <div class="metric-card"><span>No-op vs backfill</span><b>{speedup:.1f}x</b></div>
+        <div class="metric-card"><span>Judge calls saved vs naive replay</span><b>{saved_verifier_calls}</b></div>
+        <div class="metric-card"><span>Illustrative judge cost avoided</span><b>${estimated_saved_cost:.2f}</b></div>
+        <div class="metric-card"><span>Measured reward calls</span><b>{actual_stage_calls["reward"]}</b></div>
       </section>
     </header>
 
@@ -1350,8 +1611,8 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
       <div class="section-head">
         <div>
           <p class="eyebrow">Run Timeline</p>
-          <h2>Five updates, one maintained artifact graph</h2>
-          <p>Click a run to inspect the per-trajectory delta matrix.</p>
+          <h2>Six updates, one maintained artifact graph</h2>
+          <p>Click a run to inspect observed parser, feature, judge, reward, and target deltas.</p>
         </div>
       </div>
       <div class="timeline">{run_cards}</div>
@@ -1366,9 +1627,33 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
         <div>
           <p class="eyebrow">Control Plane Shape</p>
           <h2>One declaration keeps every artifact aligned</h2>
+          <p>Reward rows, diff rows, training exports, owned row files, and judge audit logs stay in step with the same trajectory-level declaration.</p>
         </div>
       </div>
       {_render_artifact_map()}
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Without / With</p>
+          <h2>The delta engine replaces broad replay scripts</h2>
+        </div>
+      </div>
+      <div class="contrast-grid">
+        <div class="contrast-panel">
+          <strong>Without maintained reward views</strong>
+          <p>Reward or judge edits trigger coarse replay jobs.</p>
+          <p>Training JSONL can drift from catalog and diff state.</p>
+          <p>Quarantined trajectories can leave stale exported files.</p>
+        </div>
+        <div class="contrast-panel">
+          <strong>With CocoIndex</strong>
+          <p>Function inputs, prompt text, and Python code deps decide what reruns.</p>
+          <p>SQLite, JSONL, row files, and reports are declared together.</p>
+          <p>Owned target state removes stale training output automatically.</p>
+        </div>
+      </div>
     </section>
 
     <section class="section insight-grid">
@@ -1378,9 +1663,19 @@ def _render_dashboard(runs: Sequence[DemoRun]) -> str:
         <div class="bars">{_render_training_bars(runs)}</div>
       </div>
       <div>
-        <p class="eyebrow">Takeaway</p>
-        <h2>What changed is explicit</h2>
-        <p class="lede">The no-op run adds zero verifier calls. Adding a trajectory touches just that trajectory. Switching policy invalidates reward-dependent layers. Quarantine removes owned training artifacts.</p>
+        <p class="eyebrow">Judge Provenance</p>
+        <h2>LLM judge prompt hashes by run</h2>
+        <div class="audit-list">{_render_verifier_provenance(runs)}</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">What To Notice</p>
+          <h2>The hard parts are measured</h2>
+          <p>The no-op run records zero stage calls. Adding one trajectory records one parser/features/judge/reward path. Changing the judge prompt records judge+reward calls but no parser work. Changing Python reward code records reward calls only. Quarantine cleans owned training output.</p>
+        </div>
       </div>
     </section>
 
@@ -1436,8 +1731,14 @@ def _run_demo() -> None:
         (
             "strict-policy",
             "Switch reward policy",
-            "Tighten reward thresholds and verifier prompt, invalidating reward layers.",
+            "Tighten reward thresholds and judge prompt, invalidating reward layers.",
             lambda: _set_policy("strict", announce=False),
+        ),
+        (
+            "code-change",
+            "Change reward code",
+            "Edit Python scoring logic while parser and judge results stay cached.",
+            lambda: _set_reward_logic("tool_trace_bonus", announce=False),
         ),
         (
             "quarantine",
@@ -1452,12 +1753,14 @@ def _run_demo() -> None:
                 prepare()
             print(f"Running: {title}")
             runs.append(_run_update_step(run_id, title, description))
-        _write_demo_artifacts(runs)
     finally:
         _restore_seed_inputs()
+    _reset_demo(announce=False)
+    app.update_blocking()
+    _write_demo_artifacts(runs)
     print(f"Wrote {DASHBOARD_PATH.relative_to(BASE_DIR)}")
     print(f"Wrote {DEMO_RUNS_PATH.relative_to(BASE_DIR)}")
-    print("Restored seed trajectories and balanced policy.")
+    print("Restored seed trajectories, balanced policy, and baseline outputs.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1480,6 +1783,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "set-policy", help="Switch reward_policy.json between demo policies."
     )
     set_policy.add_argument("name", choices=["balanced", "strict"])
+    set_reward_logic = subparsers.add_parser(
+        "set-reward-logic", help="Switch reward_logic.py between demo code variants."
+    )
+    set_reward_logic.add_argument("name", choices=["base", "tool_trace_bonus"])
     quarantine = subparsers.add_parser(
         "quarantine", help="Mark a trajectory as quarantined."
     )
@@ -1506,6 +1813,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_demo()
         elif command == "set-policy":
             _set_policy(cast(str, args.name))
+        elif command == "set-reward-logic":
+            _set_reward_logic(cast(str, args.name))
         elif command == "quarantine":
             _set_quarantine(cast(str, args.trajectory_id), True)
         elif command == "unquarantine":

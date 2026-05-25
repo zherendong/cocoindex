@@ -10,11 +10,38 @@
   "observations": [
     "Seattle is widely known for rainy weather."
   ],
+  "tool_calls": [
+    {
+      "name": "search",
+      "args": {
+        "query": "Seattle climate reputation"
+      },
+      "result": {
+        "snippet": "Seattle is widely known for rainy weather."
+      },
+      "latency_ms": 412
+    },
+    {
+      "name": "open",
+      "args": {
+        "url": "https://weather.example/seattle-overview"
+      },
+      "result": {
+        "status": 200
+      },
+      "latency_ms": 173
+    }
+  ],
   "final_answer": "Seattle is known for rainy weather.",
   "ground_truth": "Seattle is known for rainy weather.",
   "metadata": {
     "model": "agent-alpha",
+    "model_version": "agent-alpha-rft-2026-05-10",
     "environment": "browser-mini",
+    "sample_temperature": 0.6,
+    "train_step": 18400,
+    "prompt_template_version": "browser-rubric-v5",
+    "token_count": 512,
     "baseline_label": "pass"
   },
   "quarantined": false

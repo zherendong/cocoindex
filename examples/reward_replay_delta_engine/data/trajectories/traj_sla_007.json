@@ -1,0 +1,62 @@
+{
+  "trajectory_id": "traj_sla_007",
+  "task_id": "support-mini-019",
+  "prompt": "Find the response target for Sev-1 incidents in the current support SLA. Answer with only the duration.",
+  "actions": [
+    "search: current support SLA Sev-1 response target",
+    "open: support SLA handbook",
+    "tool: extract sev1.response_target_minutes",
+    "thought: convert minutes into a concise duration",
+    "thought: final answer should include only the duration"
+  ],
+  "observations": [
+    "The support SLA handbook says sev1.response_target_minutes = 15.",
+    "The table says Sev-2 incidents have a 2 hour response target."
+  ],
+  "tool_calls": [
+    {
+      "name": "search",
+      "args": {
+        "query": "current support SLA Sev-1 response target"
+      },
+      "result": {
+        "snippet": "Current SLA handbook includes response targets by severity."
+      },
+      "latency_ms": 365
+    },
+    {
+      "name": "open",
+      "args": {
+        "url": "https://support.example/internal/sla-handbook"
+      },
+      "result": {
+        "status": 200,
+        "title": "Support SLA Handbook"
+      },
+      "latency_ms": 218
+    },
+    {
+      "name": "extract_json",
+      "args": {
+        "path": "$.incident_response.sev1.response_target_minutes"
+      },
+      "result": {
+        "value": 15
+      },
+      "latency_ms": 44
+    }
+  ],
+  "final_answer": "15 minutes",
+  "ground_truth": "15 minutes",
+  "metadata": {
+    "model": "agent-delta",
+    "model_version": "agent-delta-grpo-2026-05-19",
+    "environment": "support-browser-mini",
+    "sample_temperature": 0.55,
+    "train_step": 22100,
+    "prompt_template_version": "support-policy-v4",
+    "token_count": 904,
+    "baseline_label": "pass"
+  },
+  "quarantined": false
+}

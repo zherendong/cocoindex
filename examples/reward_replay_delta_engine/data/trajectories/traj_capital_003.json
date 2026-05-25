@@ -6,11 +6,17 @@
     "thought: recall from memory"
   ],
   "observations": [],
+  "tool_calls": [],
   "final_answer": "Sydney",
   "ground_truth": "Canberra",
   "metadata": {
     "model": "agent-beta",
+    "model_version": "agent-beta-rft-2026-05-12",
     "environment": "qa-mini",
+    "sample_temperature": 0.7,
+    "train_step": 19120,
+    "prompt_template_version": "memory-qa-v2",
+    "token_count": 98,
     "baseline_label": "pass"
   },
   "quarantined": false

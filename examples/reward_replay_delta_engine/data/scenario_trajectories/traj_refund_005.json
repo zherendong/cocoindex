@@ -10,11 +10,38 @@
   "observations": [
     "The policy says refund requests are accepted for 30 days after purchase."
   ],
+  "tool_calls": [
+    {
+      "name": "search",
+      "args": {
+        "query": "refund policy window"
+      },
+      "result": {
+        "snippet": "Refund requests are accepted for 30 days after purchase."
+      },
+      "latency_ms": 340
+    },
+    {
+      "name": "open",
+      "args": {
+        "url": "https://support.example/returns-policy"
+      },
+      "result": {
+        "status": 200
+      },
+      "latency_ms": 221
+    }
+  ],
   "final_answer": "Refund requests are accepted for 30 days after purchase.",
   "ground_truth": "30 days",
   "metadata": {
     "model": "agent-gamma",
+    "model_version": "agent-gamma-rft-2026-05-18",
     "environment": "support-mini",
+    "sample_temperature": 0.5,
+    "train_step": 20480,
+    "prompt_template_version": "support-policy-v4",
+    "token_count": 684,
     "baseline_label": "fail"
   },
   "quarantined": false

@@ -1,0 +1,53 @@
+{
+  "trajectory_id": "traj_sql_006",
+  "task_id": "analytics-mini-018",
+  "prompt": "Which enterprise plan has the highest net expansion rate this quarter? Answer with the plan and percentage.",
+  "actions": [
+    "thought: inspect account health metrics for the current quarter",
+    "sql: select plan_name, net_expansion_rate from account_health where quarter = '2026-Q1' order by net_expansion_rate desc limit 3",
+    "tool: compare the ranked rows",
+    "thought: cite the top plan with its percentage"
+  ],
+  "observations": [
+    "The SQL result ranked Enterprise Growth first with net_expansion_rate = 0.18.",
+    "The next two plans were Enterprise Core at 0.11 and Team Plus at 0.08."
+  ],
+  "tool_calls": [
+    {
+      "name": "sql",
+      "args": {
+        "query": "select plan_name, net_expansion_rate from account_health where quarter = '2026-Q1' order by net_expansion_rate desc limit 3"
+      },
+      "result": {
+        "rows": [
+          {
+            "plan_name": "Enterprise Growth",
+            "net_expansion_rate": 0.18
+          },
+          {
+            "plan_name": "Enterprise Core",
+            "net_expansion_rate": 0.11
+          },
+          {
+            "plan_name": "Team Plus",
+            "net_expansion_rate": 0.08
+          }
+        ]
+      },
+      "latency_ms": 96
+    }
+  ],
+  "final_answer": "Enterprise Growth at 18% has the highest net expansion rate.",
+  "ground_truth": "Enterprise Growth at 18%",
+  "metadata": {
+    "model": "agent-gamma",
+    "model_version": "agent-gamma-rft-2026-05-18",
+    "environment": "analytics-sql-mini",
+    "sample_temperature": 0.4,
+    "train_step": 20480,
+    "prompt_template_version": "analytics-sql-v2",
+    "token_count": 792,
+    "baseline_label": "fail"
+  },
+  "quarantined": false
+}

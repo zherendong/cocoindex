@@ -1404,8 +1404,31 @@ def _render_training_bars(runs: Sequence[DemoRun]) -> str:
 
 def _render_hashes(values: Sequence[str], *, empty: str = "cached") -> str:
     if not values:
-        return f'<span class="muted">{_h(empty)}</span>'
-    return ", ".join(f'<span class="hash">{_h(value)}</span>' for value in values)
+        return f'<span class="hash-list"><span class="muted">{_h(empty)}</span></span>'
+    hashes = "".join(f'<span class="hash">{_h(value)}</span>' for value in values)
+    return f'<span class="hash-list">{hashes}</span>'
+
+
+def _prompt_template_badge(runs: Sequence[DemoRun]) -> str:
+    prompt_templates = sorted(
+        {
+            prompt_template
+            for run in runs
+            for prompt_template in run.prompt_template_versions
+        }
+    )
+    label = (
+        "1 prompt template"
+        if len(prompt_templates) == 1
+        else f"{len(prompt_templates)} prompt templates"
+    )
+    template_list = ", ".join(prompt_templates) if prompt_templates else "none"
+    return f"""
+      <div class="dataset-badge">
+        <b>{label} in this dataset</b>
+        <span>{_h(template_list)}</span>
+      </div>
+    """
 
 
 def _render_prompt_code_provenance(runs: Sequence[DemoRun]) -> str:
@@ -1416,7 +1439,6 @@ def _render_prompt_code_provenance(runs: Sequence[DemoRun]) -> str:
           <span>Judge</span>
           <span>Prompt hash</span>
           <span>Reward code</span>
-          <span>Prompt templates</span>
         </div>
         """
     ]
@@ -1428,7 +1450,6 @@ def _render_prompt_code_provenance(runs: Sequence[DemoRun]) -> str:
               <b>{run.verifier_calls_added}</b>
               <span>{_render_hashes(run.prompt_hashes)}</span>
               <span>{_render_hashes(run.reward_logic_versions, empty="none")}</span>
-              <span>{_render_hashes(run.prompt_template_versions, empty="none")}</span>
             </div>
             """
         )
@@ -1640,12 +1661,15 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .bar-track {{ height: 12px; border-radius: 999px; background: #e8e0d2; overflow: hidden; }}
     .bar-fill {{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--teal), var(--green)); }}
     .audit-list {{ display: grid; gap: 10px; margin-top: 14px; }}
-    .audit-row {{ display: grid; grid-template-columns: 1fr 34px 1.1fr 1.1fr 1.2fr; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee8dc; font-size: 13px; }}
+    .audit-row {{ display: grid; grid-template-columns: 1fr 34px 1.2fr 1.2fr; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee8dc; font-size: 13px; }}
     .audit-row:last-child {{ border-bottom: 0; }}
     .audit-heading {{ color: var(--muted); font-size: 11px; font-weight: 900; text-transform: uppercase; }}
     .audit-row b {{ color: var(--coral); font-variant-numeric: tabular-nums; }}
-    .hash {{ display: inline-flex; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 999px; background: #ece7ff; color: #4f3f87; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
+    .hash-list {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }}
+    .hash {{ display: inline-flex; padding: 4px 7px; border-radius: 999px; background: #ece7ff; color: #4f3f87; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
     .muted {{ color: var(--muted); }}
+    .dataset-badge {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; border: 1px solid var(--line); border-radius: 999px; background: white; padding: 8px 12px; margin-top: 12px; font-size: 12px; }}
+    .dataset-badge span {{ color: var(--muted); }}
     .sample-card {{ border: 1px solid var(--line); border-radius: 14px; background: #1d1c18; color: #fffdf8; padding: 16px; overflow: auto; }}
     .sample-card pre {{ margin: 0; min-width: 520px; font-size: 12px; line-height: 1.45; white-space: pre; }}
     .contrast-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
@@ -1653,6 +1677,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .contrast-panel strong {{ display: block; margin-bottom: 10px; }}
     .contrast-panel p {{ margin: 0 0 10px; color: var(--muted); font-size: 14px; }}
     .contrast-panel p:last-child {{ margin-bottom: 0; }}
+    .impact-badge {{ display: inline-flex; align-items: center; border-radius: 999px; background: #e5f3e5; border: 1px solid #bddfbe; color: #23632e !important; padding: 8px 12px; font-weight: 900; }}
     .artifact-map {{ width: 100%; height: auto; margin-top: 8px; }}
     .artifact-map .node rect {{ fill: white; stroke-width: 2; }}
     .artifact-map .source rect {{ stroke: var(--coral); }}
@@ -1741,6 +1766,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         </div>
         <div class="contrast-panel">
           <strong>With CocoIndex</strong>
+          <p class="impact-badge">10K-row projection: ≈ {projected_saved_calls:,} judge calls / ${projected_saved_cost:,.0f} avoided.</p>
           <p>Actual run: {total_calls} judge calls; no-op: {noop_stage_calls} stage calls.</p>
           <p>Python reward-code change: {code_change_judge_calls} judge calls, {code_change_reward_calls} reward calls.</p>
           <p>SQLite, JSONL, row files, and reports are declared together.</p>
@@ -1758,6 +1784,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
       <div>
         <p class="eyebrow">Prompt & Code Provenance</p>
         <h2>What changed across runs</h2>
+        {_prompt_template_badge(runs)}
         <div class="audit-list">{_render_prompt_code_provenance(runs)}</div>
       </div>
     </section>

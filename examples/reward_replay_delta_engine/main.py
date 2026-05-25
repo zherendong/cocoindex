@@ -1315,6 +1315,7 @@ def _render_run_card(run: DemoRun, index: int, max_duration_ms: int) -> str:
         </span>
         <span class="run-kpis">
           <span><b>{run.duration_ms}</b> ms</span>
+          <span><b>{run.stage_calls.get("parse", 0)}</b> parser calls</span>
           <span><b>{run.verifier_calls_added}</b> judge calls</span>
           <span><b>{run.stage_calls.get("reward", 0)}</b> reward calls</span>
           <span><b>{changed_rows}</b> row updates</span>
@@ -1384,14 +1385,17 @@ def _short_trajectory_id(trajectory_id: str) -> str:
 def _heatmap_state(status: DemoTrajectoryStatus | None) -> str:
     if status is None:
         return "none"
-    compute_stage_active = [
-        status.parser == "ran",
-        status.features == "ran",
-        status.verifier in {"computed", "reran"},
-        status.reward in {"computed", "recomputed"},
-    ]
-    if all(compute_stage_active):
+    parser_ran = status.parser == "ran"
+    features_ran = status.features == "ran"
+    judge_ran = status.verifier in {"computed", "reran"}
+    reward_ran = status.reward in {"computed", "recomputed"}
+    compute_stage_active = [parser_ran, features_ran, judge_ran, reward_ran]
+    if parser_ran and features_ran and judge_ran and reward_ran:
         return "full"
+    if judge_ran and reward_ran:
+        return "judge-reward"
+    if reward_ran and not (parser_ran or features_ran or judge_ran):
+        return "reward-only"
     if (
         any(compute_stage_active)
         or status.source in {"new", "edited"}
@@ -1434,7 +1438,7 @@ def _render_delta_heatmap(runs: Sequence[DemoRun]) -> str:
             )
         rows.append(
             f"""
-            <div class="heatmap-run">{_h(run.title)}</div>
+            <a class="heatmap-run" href="#{_h(run.run_id)}">{_h(run.title)}</a>
             {"".join(cells)}
             """
         )
@@ -1448,6 +1452,8 @@ def _render_delta_heatmap(runs: Sequence[DemoRun]) -> str:
         <div class="heatmap-legend">
           <span><i class="none"></i>No work</span>
           <span><i class="partial"></i>Partial replay</span>
+          <span><i class="reward-only"></i>Reward only</span>
+          <span><i class="judge-reward"></i>Judge + reward</span>
           <span><i class="full"></i>Full compute path</span>
         </div>
       </div>
@@ -1649,6 +1655,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
       --shadow: 0 18px 50px rgba(48, 42, 32, 0.12);
     }}
     * {{ box-sizing: border-box; }}
+    html {{ scroll-behavior: smooth; }}
     body {{
       margin: 0;
       background:
@@ -1723,17 +1730,22 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .heatmap-wrap {{ border: 1px solid var(--line); border-radius: 14px; background: white; padding: 14px; margin-bottom: 18px; overflow-x: auto; }}
     .heatmap-grid {{ display: grid; grid-template-columns: minmax(130px, 1fr) repeat(var(--cols), minmax(58px, 0.7fr)); gap: 6px; align-items: center; min-width: 760px; }}
     .heatmap-corner, .heatmap-label, .heatmap-run {{ color: var(--muted); font-size: 11px; font-weight: 900; }}
-    .heatmap-run {{ color: var(--ink); }}
+    .heatmap-run {{ color: var(--ink); text-decoration: none; }}
+    .heatmap-run:hover {{ color: var(--coral); }}
     .heatmap-label {{ text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .heatmap-cell {{ min-height: 22px; border-radius: 7px; border: 1px solid transparent; }}
     .heatmap-cell.none {{ background: #eeebe4; border-color: #ded8cc; }}
     .heatmap-cell.partial {{ background: #fff0c7; border-color: #efd38b; }}
+    .heatmap-cell.reward-only {{ background: #ffe2bb; border-color: #f0be75; }}
+    .heatmap-cell.judge-reward {{ background: #d99632; border-color: #bf7a16; }}
     .heatmap-cell.full {{ background: #dff2e2; border-color: #bddfbe; }}
     .heatmap-legend {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 12px; font-weight: 800; }}
     .heatmap-legend span {{ display: inline-flex; gap: 6px; align-items: center; }}
     .heatmap-legend i {{ width: 14px; height: 14px; border-radius: 5px; border: 1px solid var(--line); }}
     .heatmap-legend i.none {{ background: #eeebe4; }}
     .heatmap-legend i.partial {{ background: #fff0c7; border-color: #efd38b; }}
+    .heatmap-legend i.reward-only {{ background: #ffe2bb; border-color: #f0be75; }}
+    .heatmap-legend i.judge-reward {{ background: #d99632; border-color: #bf7a16; }}
     .heatmap-legend i.full {{ background: #dff2e2; border-color: #bddfbe; }}
     .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }}
     .insight-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}

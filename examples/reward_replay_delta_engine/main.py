@@ -1306,7 +1306,7 @@ def _render_run_card(run: DemoRun, index: int, max_duration_ms: int) -> str:
         run.reward_rows_changed + run.reward_rows_added + run.reward_rows_removed
     )
     return f"""
-      <button class="run-card{" is-active" if index == 0 else ""}" data-run-tab="{_h(run.run_id)}">
+      <div class="run-card">
         <span class="run-index">{index + 1:02d}</span>
         <span class="run-copy">
           <strong>{_h(run.title)}</strong>
@@ -1319,11 +1319,11 @@ def _render_run_card(run: DemoRun, index: int, max_duration_ms: int) -> str:
           <span><b>{run.stage_calls.get("reward", 0)}</b> reward calls</span>
           <span><b>{changed_rows}</b> row updates</span>
         </span>
-      </button>
+      </div>
     """
 
 
-def _render_status_table(run: DemoRun, active: bool) -> str:
+def _render_status_table(run: DemoRun) -> str:
     rows = []
     for status in run.statuses:
         score = "-" if status.score is None else f"{status.score:.3f}"
@@ -1331,7 +1331,6 @@ def _render_status_table(run: DemoRun, active: bool) -> str:
             f"""
             <tr>
               <td class="mono">{_h(status.trajectory_id)}</td>
-              <td>{_render_status_pill(status.source)}</td>
               <td>{_render_status_pill(status.parser)}</td>
               <td>{_render_status_pill(status.features)}</td>
               <td>{_render_status_pill(status.verifier)}</td>
@@ -1344,27 +1343,12 @@ def _render_status_table(run: DemoRun, active: bool) -> str:
             """
         )
     return f"""
-      <section class="run-panel{" is-active" if active else ""}" data-run-panel="{_h(run.run_id)}">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Delta Matrix</p>
-            <h2>{_h(run.title)}</h2>
-          </div>
-          <div class="panel-metrics">
-            <span>{run.duration_ms} ms</span>
-            <span>{run.stage_calls.get("parse", 0)} parser calls</span>
-            <span>{run.stage_calls.get("verifier", 0)} judge calls</span>
-            <span>{run.stage_calls.get("reward", 0)} reward calls</span>
-            <span>{run.label_flips} run-over-run flips</span>
-            <span>{run.training_added} train added / {run.training_removed} removed</span>
-          </div>
-        </div>
+      <div class="run-panel">
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>Trajectory</th>
-                <th>Source</th>
                 <th>Parser</th>
                 <th>Features</th>
                 <th>Judge</th>
@@ -1380,7 +1364,93 @@ def _render_status_table(run: DemoRun, active: bool) -> str:
             </tbody>
           </table>
         </div>
+      </div>
+    """
+
+
+def _render_run_section(run: DemoRun, index: int, max_duration_ms: int) -> str:
+    return f"""
+      <section class="run-stack" id="{_h(run.run_id)}">
+        {_render_run_card(run, index, max_duration_ms)}
+        {_render_status_table(run)}
       </section>
+    """
+
+
+def _short_trajectory_id(trajectory_id: str) -> str:
+    return trajectory_id.removeprefix("traj_")
+
+
+def _heatmap_state(status: DemoTrajectoryStatus | None) -> str:
+    if status is None:
+        return "none"
+    compute_stage_active = [
+        status.parser == "ran",
+        status.features == "ran",
+        status.verifier in {"computed", "reran"},
+        status.reward in {"computed", "recomputed"},
+    ]
+    if all(compute_stage_active):
+        return "full"
+    if (
+        any(compute_stage_active)
+        or status.source in {"new", "edited"}
+        or status.catalog in {"inserted", "updated", "deleted"}
+        or status.training in {"created", "removed"}
+    ):
+        return "partial"
+    return "none"
+
+
+def _render_delta_heatmap(runs: Sequence[DemoRun]) -> str:
+    trajectory_ids = sorted(
+        {status.trajectory_id for run in runs for status in run.statuses}
+    )
+    header_cells = "".join(
+        f'<div class="heatmap-label mono" title="{_h(trajectory_id)}">'
+        f"{_h(_short_trajectory_id(trajectory_id))}</div>"
+        for trajectory_id in trajectory_ids
+    )
+    rows = []
+    for run in runs:
+        statuses = {status.trajectory_id: status for status in run.statuses}
+        cells = []
+        for trajectory_id in trajectory_ids:
+            status = statuses.get(trajectory_id)
+            state = _heatmap_state(status)
+            title = (
+                f"{run.title} / {trajectory_id}: {state}"
+                if status is None
+                else (
+                    f"{run.title} / {trajectory_id}: {state}; "
+                    f"parser={status.parser}, features={status.features}, "
+                    f"judge={status.verifier}, reward={status.reward}, "
+                    f"catalog={status.catalog}, training={status.training}"
+                )
+            )
+            cells.append(
+                f'<div class="heatmap-cell {state}" title="{_h(title)}">'
+                f'<span class="sr-only">{_h(title)}</span></div>'
+            )
+        rows.append(
+            f"""
+            <div class="heatmap-run">{_h(run.title)}</div>
+            {"".join(cells)}
+            """
+        )
+    return f"""
+      <div class="heatmap-wrap" aria-label="Run-by-trajectory delta heatmap">
+        <div class="heatmap-grid" style="--cols: {len(trajectory_ids)}">
+          <div class="heatmap-corner">Run</div>
+          {header_cells}
+          {"".join(rows)}
+        </div>
+        <div class="heatmap-legend">
+          <span><i class="none"></i>No work</span>
+          <span><i class="partial"></i>Partial replay</span>
+          <span><i class="full"></i>Full compute path</span>
+        </div>
+      </div>
     """
 
 
@@ -1552,10 +1622,10 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         stage: sum(run.stage_calls.get(stage, 0) for run in runs)
         for stage in ("parse", "features", "verifier", "reward")
     }
-    run_cards = "".join(
-        _render_run_card(run, i, max_duration) for i, run in enumerate(runs)
+    run_sections = "".join(
+        _render_run_section(run, i, max_duration) for i, run in enumerate(runs)
     )
-    panels = "".join(_render_status_table(run, i == 0) for i, run in enumerate(runs))
+    heatmap = _render_delta_heatmap(runs)
     generated_at = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en">
@@ -1612,7 +1682,8 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .section {{ border-radius: 18px; padding: 22px; margin-top: 18px; }}
     .section-head {{ display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 18px; }}
     .section-head p {{ max-width: 660px; margin: 6px 0 0; color: var(--muted); }}
-    .timeline {{ display: grid; gap: 12px; }}
+    .run-stack-list {{ display: grid; gap: 18px; }}
+    .run-stack {{ display: grid; gap: 10px; }}
     .run-card {{
       width: 100%;
       border-radius: 14px;
@@ -1623,9 +1694,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
       align-items: center;
       color: inherit;
       text-align: left;
-      cursor: pointer;
     }}
-    .run-card.is-active {{ border-color: rgba(228, 95, 69, 0.6); outline: 3px solid rgba(228, 95, 69, 0.13); }}
     .run-index {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: #1d1c18; color: white; font-weight: 900; }}
     .run-copy strong {{ display: block; font-size: 16px; }}
     .run-copy small {{ display: block; color: var(--muted); margin-top: 3px; font-size: 13px; }}
@@ -1634,14 +1703,10 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .run-kpis {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: end; }}
     .run-kpis span {{ background: var(--wash); border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; font-size: 12px; color: var(--muted); }}
     .run-kpis b {{ color: var(--ink); }}
-    .run-panel {{ display: none; }}
-    .run-panel.is-active {{ display: block; }}
-    .panel-head {{ display: flex; justify-content: space-between; gap: 16px; margin-bottom: 16px; align-items: end; }}
-    .panel-metrics {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: end; }}
-    .panel-metrics span {{ border-radius: 999px; padding: 7px 10px; background: #efe8da; color: #5d574d; font-size: 12px; font-weight: 800; }}
+    .run-panel {{ display: block; }}
     .table-wrap {{ overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: white; }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 860px; }}
-    th, td {{ padding: 12px 13px; border-bottom: 1px solid #eee8dc; text-align: left; font-size: 13px; white-space: nowrap; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
+    th, td {{ padding: 8px 11px; border-bottom: 1px solid #eee8dc; text-align: left; font-size: 12px; white-space: nowrap; }}
     th {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; background: #fbf6ed; }}
     tr:last-child td {{ border-bottom: 0; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
@@ -1655,6 +1720,22 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     .label-badge {{ font-weight: 900; }}
     .label-badge.pass {{ color: var(--green); }}
     .label-badge.fail {{ color: var(--coral); }}
+    .heatmap-wrap {{ border: 1px solid var(--line); border-radius: 14px; background: white; padding: 14px; margin-bottom: 18px; overflow-x: auto; }}
+    .heatmap-grid {{ display: grid; grid-template-columns: minmax(130px, 1fr) repeat(var(--cols), minmax(58px, 0.7fr)); gap: 6px; align-items: center; min-width: 760px; }}
+    .heatmap-corner, .heatmap-label, .heatmap-run {{ color: var(--muted); font-size: 11px; font-weight: 900; }}
+    .heatmap-run {{ color: var(--ink); }}
+    .heatmap-label {{ text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .heatmap-cell {{ min-height: 22px; border-radius: 7px; border: 1px solid transparent; }}
+    .heatmap-cell.none {{ background: #eeebe4; border-color: #ded8cc; }}
+    .heatmap-cell.partial {{ background: #fff0c7; border-color: #efd38b; }}
+    .heatmap-cell.full {{ background: #dff2e2; border-color: #bddfbe; }}
+    .heatmap-legend {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .heatmap-legend span {{ display: inline-flex; gap: 6px; align-items: center; }}
+    .heatmap-legend i {{ width: 14px; height: 14px; border-radius: 5px; border: 1px solid var(--line); }}
+    .heatmap-legend i.none {{ background: #eeebe4; }}
+    .heatmap-legend i.partial {{ background: #fff0c7; border-color: #efd38b; }}
+    .heatmap-legend i.full {{ background: #dff2e2; border-color: #bddfbe; }}
+    .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }}
     .insight-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
     .bars {{ display: grid; gap: 12px; margin-top: 14px; }}
     .bar-row {{ display: grid; grid-template-columns: 150px 1fr 30px; gap: 12px; align-items: center; font-size: 13px; }}
@@ -1695,7 +1776,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
       .contrast-grid {{ grid-template-columns: 1fr; }}
       .run-card {{ grid-template-columns: 44px 1fr; }}
       .run-kpis {{ grid-column: 1 / -1; justify-content: start; }}
-      .panel-head, .section-head {{ align-items: start; flex-direction: column; }}
+      .section-head {{ align-items: start; flex-direction: column; }}
       .bar-row {{ grid-template-columns: 1fr; gap: 6px; }}
       .audit-row {{ grid-template-columns: 1fr; }}
     }}
@@ -1727,16 +1808,13 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
     <section class="section">
       <div class="section-head">
         <div>
-          <p class="eyebrow">Run Timeline</p>
-          <h2>Six updates, one maintained artifact graph</h2>
-          <p>Click a run to inspect observed parser, feature, judge, reward, and target deltas.</p>
+          <p class="eyebrow">Replay Progression</p>
+          <h2>Six updates, each matrix in reading order</h2>
+          <p>The heatmap summarizes which trajectories did work in each run. The stacked matrices below show the exact parser, feature, judge, reward, and target deltas without a click.</p>
         </div>
       </div>
-      <div class="timeline">{run_cards}</div>
-    </section>
-
-    <section class="section">
-      {panels}
+      {heatmap}
+      <div class="run-stack-list">{run_sections}</div>
     </section>
 
     <section class="section">
@@ -1812,17 +1890,6 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
 
     <footer>Generated {generated_at}. Source data and generated artifacts live under <span class="mono">examples/reward_replay_delta_engine</span>.</footer>
   </main>
-  <script>
-    const tabs = Array.from(document.querySelectorAll('[data-run-tab]'));
-    const panels = Array.from(document.querySelectorAll('[data-run-panel]'));
-    for (const tab of tabs) {{
-      tab.addEventListener('click', () => {{
-        const id = tab.dataset.runTab;
-        tabs.forEach((item) => item.classList.toggle('is-active', item === tab));
-        panels.forEach((panel) => panel.classList.toggle('is-active', panel.dataset.runPanel === id));
-      }});
-    }}
-  </script>
 </body>
 </html>
 """

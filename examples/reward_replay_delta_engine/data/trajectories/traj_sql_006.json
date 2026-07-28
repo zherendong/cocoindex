@@ -47,6 +47,7 @@
     "train_step": 20480,
     "prompt_template_version": "analytics-sql-v2",
     "token_count": 792,
+    "baseline_reward_version": "v17-prod",
     "baseline_label": "fail"
   },
   "quarantined": false

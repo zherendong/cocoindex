@@ -42,6 +42,7 @@
     "train_step": 20480,
     "prompt_template_version": "support-policy-v4",
     "token_count": 684,
+    "baseline_reward_version": "v17-prod",
     "baseline_label": "fail"
   },
   "quarantined": false

@@ -1,6 +1,6 @@
 {
   "reward_version": "v19-strict",
-  "baseline_reward_version": "v18-balanced",
+  "baseline_reward_version": "v17-prod",
   "verifier_prompt": "Strict verifier: require an exact final answer, at least one real tool action, and a short trajectory.",
   "pass_threshold": 0.86,
   "training_threshold": 0.9,

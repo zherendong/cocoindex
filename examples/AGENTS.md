@@ -136,6 +136,7 @@ A walkthrough URL means there's a step-by-step guide at
 ### Custom sources / targets / streaming
 - `pdf_to_markdown` — incremental PDF → Markdown with docling (local, no services). *(walkthrough: pdf-to-markdown)*
 - `files_transform` — watch Markdown files → HTML, live mode (local, no services).
+- `reward_replay_delta_engine` — RL trajectories → reward catalog, trainer JSONL, and measured delta-replay dashboard.
 - `csv_to_kafka` — watch CSVs → publish rows to Kafka.
 - `kafka_to_lancedb` — consume Kafka → route to LanceDB tables.
 

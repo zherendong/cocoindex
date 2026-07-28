@@ -42,6 +42,7 @@
     "train_step": 18400,
     "prompt_template_version": "browser-rubric-v5",
     "token_count": 512,
+    "baseline_reward_version": "v17-prod",
     "baseline_label": "pass"
   },
   "quarantined": false

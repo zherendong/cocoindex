@@ -17,6 +17,7 @@
     "train_step": 19120,
     "prompt_template_version": "memory-qa-v2",
     "token_count": 98,
+    "baseline_reward_version": "v17-prod",
     "baseline_label": "pass"
   },
   "quarantined": false

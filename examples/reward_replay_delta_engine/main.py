@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -25,8 +26,6 @@ from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
-REPO_ROOT = BASE_DIR.parents[1]
-PYTHON_SOURCE_DIR = REPO_ROOT / "python"
 DATA_DIR = BASE_DIR / "data"
 TRAJECTORY_DIR = DATA_DIR / "trajectories"
 SEED_TRAJECTORY_DIR = DATA_DIR / "seed_trajectories"
@@ -45,6 +44,7 @@ DEMO_RUNS_PATH = OUTPUT_DIR / "demo_runs.json"
 DASHBOARD_PATH = OUTPUT_DIR / "dashboard.html"
 JUDGE_COST_PER_CALL_USD = 0.05
 REFERENCE_SCALE_TRAJECTORIES = 10_000
+_TRAJECTORY_BATCH_SIZE = 32
 
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection](
     "reward_replay_delta_engine/sqlite"
@@ -60,6 +60,7 @@ _TOOL_ACTION_PREFIXES = (
     "tool:",
 )
 _ACTIVE_DEMO_RUN_ID: str | None = os.environ.get("REWARD_REPLAY_DEMO_RUN_ID")
+_AUDIT_WRITE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class Trajectory:
     train_step: int
     prompt_template_version: str
     token_count: int
+    baseline_reward_version: str
     baseline_label: str
     quarantined: bool
 
@@ -138,6 +140,7 @@ class RewardRow:
     include_in_training: bool
     verifier_label: str
     verifier_confidence: float
+    judge_prompt_hash: str
     changed_from_baseline: bool
     model: str
     model_version: str
@@ -159,6 +162,8 @@ class RewardDiffRow:
     new_label: str
     score: float
     include_in_training: bool
+    reward_logic_version: str
+    judge_prompt_hash: str
     reason: str
 
 
@@ -356,6 +361,7 @@ def _load_trajectory(data: Mapping[str, object]) -> Trajectory:
             metadata, "prompt_template_version", "unknown"
         ),
         token_count=_optional_int(metadata, "token_count", 0),
+        baseline_reward_version=_required_str(metadata, "baseline_reward_version"),
         baseline_label=_required_str(metadata, "baseline_label"),
         quarantined=_optional_bool(data, "quarantined", False),
     )
@@ -392,9 +398,35 @@ def _count_tool_actions(actions: Sequence[str]) -> int:
 
 def _append_jsonl(path: pathlib.Path, record: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, sort_keys=True))
-        f.write("\n")
+    line = json.dumps(record, sort_keys=True) + "\n"
+    with _AUDIT_WRITE_LOCK, path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def _write_jsonl(path: pathlib.Path, records: Sequence[Mapping[str, object]]) -> None:
+    path.write_text(
+        "".join(f"{json.dumps(record, sort_keys=True)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def _judge_prompt_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode()).hexdigest()[:10]
+
+
+def _judge_confidence(features: RewardFeatures) -> float:
+    if features.answer_exact:
+        return 0.96
+    return round(min(0.95, 0.45 + features.answer_overlap * 0.5), 2)
+
+
+def _validate_baseline_version(trajectory: Trajectory, policy: RewardPolicy) -> None:
+    if trajectory.baseline_reward_version != policy.baseline_reward_version:
+        raise ValueError(
+            f"Trajectory {trajectory.trajectory_id!r} has baseline reward version "
+            f"{trajectory.baseline_reward_version!r}, but the active policy expects "
+            f"{policy.baseline_reward_version!r}"
+        )
 
 
 def _append_stage_audit(stage: str, trajectory_id: str) -> None:
@@ -462,7 +494,7 @@ async def run_verifier(
 ) -> VerifierLabel:
     _append_stage_audit("verifier", features.trajectory_id)
     await asyncio.sleep(0.25)
-    prompt_hash = hashlib.sha256(verifier_prompt.encode()).hexdigest()[:10]
+    prompt_hash = _judge_prompt_hash(verifier_prompt)
     strict = "strict" in verifier_prompt.lower()
     if strict:
         passed = (
@@ -474,9 +506,7 @@ async def run_verifier(
         passed = features.answer_exact or features.answer_contains_ground_truth
 
     label = "pass" if passed else "fail"
-    confidence = (
-        0.96 if features.answer_exact else round(0.45 + features.answer_overlap, 2)
-    )
+    confidence = _judge_confidence(features)
     rationale = (
         "exact answer accepted"
         if features.answer_exact
@@ -573,7 +603,9 @@ def _training_record_json(
             "trajectory_id": trajectory.trajectory_id,
             "task_id": trajectory.task_id,
             "reward_version": policy.reward_version,
+            "baseline_reward_version": trajectory.baseline_reward_version,
             "reward_logic_version": _reward_logic.REWARD_LOGIC_VERSION,
+            "judge_prompt_hash": _judge_prompt_hash(policy.verifier_prompt),
             "messages": [
                 {"role": "user", "content": trajectory.prompt},
                 {"role": "assistant", "content": trajectory.final_answer},
@@ -605,6 +637,7 @@ async def process_trajectory(
     verifier_audit_path: pathlib.Path,
 ) -> ProcessedTrajectory:
     trajectory = await parse_trajectory(file)
+    _validate_baseline_version(trajectory, policy)
     features = extract_features(trajectory)
     verifier = await run_verifier(
         features,
@@ -619,13 +652,14 @@ async def process_trajectory(
             task_id=trajectory.task_id,
             reward_version=policy.reward_version,
             reward_logic_version=_reward_logic.REWARD_LOGIC_VERSION,
-            baseline_reward_version=policy.baseline_reward_version,
+            baseline_reward_version=trajectory.baseline_reward_version,
             baseline_label=trajectory.baseline_label,
             label=decision.label,
             score=decision.score,
             include_in_training=decision.include_in_training,
             verifier_label=verifier.label,
             verifier_confidence=verifier.confidence,
+            judge_prompt_hash=verifier.prompt_hash,
             changed_from_baseline=changed_from_baseline,
             model=trajectory.model,
             model_version=trajectory.model_version,
@@ -644,11 +678,13 @@ async def process_trajectory(
             row=RewardDiffRow(
                 trajectory_id=trajectory.trajectory_id,
                 reward_version=policy.reward_version,
-                baseline_reward_version=policy.baseline_reward_version,
+                baseline_reward_version=trajectory.baseline_reward_version,
                 previous_label=trajectory.baseline_label,
                 new_label=decision.label,
                 score=decision.score,
                 include_in_training=decision.include_in_training,
+                reward_logic_version=_reward_logic.REWARD_LOGIC_VERSION,
+                judge_prompt_hash=verifier.prompt_hash,
                 reason=decision.training_reason,
             )
         )
@@ -738,6 +774,34 @@ def _render_report(
 
 
 @coco.fn
+async def _process_trajectory_batch(
+    items: Sequence[tuple[str, FileLike[pathlib.Path]]],
+    policy: RewardPolicy,
+    reward_table: sqlite.TableTarget[RewardRow],
+    diff_table: sqlite.TableTarget[RewardDiffRow],
+    output_target: localfs.DirTarget,
+    verifier_audit_path: pathlib.Path,
+) -> list[ProcessedTrajectory]:
+    return list(
+        await asyncio.gather(
+            *(
+                coco.use_mount(
+                    _component_subpath_for_file_key(file_key),
+                    process_trajectory,
+                    file,
+                    policy,
+                    reward_table,
+                    diff_table,
+                    output_target,
+                    verifier_audit_path,
+                )
+                for file_key, file in items
+            )
+        )
+    )
+
+
+@coco.fn
 async def app_main(
     source_dir: pathlib.Path = TRAJECTORY_DIR,
     output_dir: pathlib.Path = OUTPUT_DIR,
@@ -768,12 +832,25 @@ async def app_main(
         path_matcher=PatternFilePathMatcher(included_patterns=["**/*.json"]),
     )
     processed: list[ProcessedTrajectory] = []
+    batch: list[tuple[str, FileLike[pathlib.Path]]] = []
     async for file_key, file in files.items():
-        processed.append(
-            await coco.use_mount(
-                _component_subpath_for_file_key(file_key),
-                process_trajectory,
-                file,
+        batch.append((file_key, file))
+        if len(batch) >= _TRAJECTORY_BATCH_SIZE:
+            processed.extend(
+                await _process_trajectory_batch(
+                    batch,
+                    policy,
+                    reward_table,
+                    diff_table,
+                    output_target,
+                    VERIFIER_AUDIT_PATH,
+                )
+            )
+            batch = []
+    if batch:
+        processed.extend(
+            await _process_trajectory_batch(
+                batch,
                 policy,
                 reward_table,
                 diff_table,
@@ -799,6 +876,7 @@ async def app_main(
             {
                 "reward_version": policy.reward_version,
                 "baseline_reward_version": policy.baseline_reward_version,
+                "judge_prompt_hash": _judge_prompt_hash(policy.verifier_prompt),
                 "trajectories": len(processed),
                 "training_rows": len(training_records),
                 "changed_labels": sum(
@@ -948,6 +1026,7 @@ def _reward_row_snapshot() -> dict[str, dict[str, object]]:
             """
             SELECT trajectory_id, label, score, include_in_training,
                    changed_from_baseline, reward_version, reward_logic_version,
+                   baseline_reward_version, judge_prompt_hash,
                    prompt_template_version
             FROM reward_rows
             ORDER BY trajectory_id
@@ -1035,11 +1114,6 @@ def _row_values(rows: Mapping[str, Mapping[str, object]], key: str) -> list[str]
 def _run_cocoindex_update(run_id: str) -> None:
     env = os.environ.copy()
     env["REWARD_REPLAY_DEMO_RUN_ID"] = run_id
-    existing_pythonpath = env.get("PYTHONPATH")
-    pythonpath_parts = [str(PYTHON_SOURCE_DIR)]
-    if existing_pythonpath:
-        pythonpath_parts.append(existing_pythonpath)
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
     subprocess.run(
         [
             sys.executable,
@@ -1583,7 +1657,9 @@ def _training_row_sample_json() -> str:
                 "reward": row.get("reward"),
                 "label": row.get("label"),
                 "reward_version": row.get("reward_version"),
+                "baseline_reward_version": row.get("baseline_reward_version"),
                 "reward_logic_version": row.get("reward_logic_version"),
+                "judge_prompt_hash": row.get("judge_prompt_hash"),
                 "metadata": {
                     "model_version": metadata.get("model_version"),
                     "train_step": metadata.get("train_step"),
@@ -1610,7 +1686,7 @@ def _render_artifact_map() -> str:
         <g class="node target"><rect x="720" y="80" width="194" height="50" rx="12"></rect><text x="817" y="110">SQLite reward_diffs</text></g>
         <g class="node target"><rect x="720" y="142" width="194" height="50" rx="12"></rect><text x="817" y="172">Training JSONL</text></g>
         <g class="node target"><rect x="720" y="204" width="194" height="50" rx="12"></rect><text x="817" y="234">Owned row files</text></g>
-        <g class="node target"><rect x="720" y="266" width="194" height="50" rx="12"></rect><text x="817" y="296">Judge audit JSONL</text></g>
+        <g class="node target"><rect x="720" y="266" width="194" height="50" rx="12"></rect><text x="817" y="296">Demo judge telemetry</text></g>
         <path class="edge" d="M178 170 C216 170 210 90 244 90"></path>
         <path class="edge" d="M178 170 C216 170 210 228 244 228"></path>
         <path class="edge" d="M408 90 C450 90 432 170 474 170"></path>
@@ -1628,6 +1704,18 @@ def _find_run(runs: Sequence[DemoRun], run_id: str) -> DemoRun | None:
     return next((run for run in runs if run.run_id == run_id), None)
 
 
+def _format_projected_count(value: int) -> str:
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}K"
+    return str(value)
+
+
+def _format_projected_cost(value: float) -> str:
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+    return f"${value:,.0f}"
+
+
 def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str:
     total_calls = runs[-1].total_verifier_calls if runs else 0
     max_duration = max((run.duration_ms for run in runs), default=1)
@@ -1641,6 +1729,8 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         * REFERENCE_SCALE_TRAJECTORIES
     )
     projected_saved_cost = projected_saved_calls * JUDGE_COST_PER_CALL_USD
+    projected_saved_calls_display = _format_projected_count(projected_saved_calls)
+    projected_saved_cost_display = _format_projected_cost(projected_saved_cost)
     speedup = 0.0
     if len(runs) >= 2 and runs[1].duration_ms > 0:
         speedup = runs[0].duration_ms / runs[1].duration_ms
@@ -1859,7 +1949,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
       <section class="metric-grid" aria-label="Demo totals">
         <div class="metric-card"><span>No-op vs backfill</span><b>{speedup:.1f}x</b><small>Includes CocoIndex CLI startup; no-op stage calls = {noop_stage_calls}.</small></div>
         <div class="metric-card"><span>Judge calls saved vs naive replay</span><b>{saved_verifier_calls}</b><small>Naive = every active trajectory reruns on every update.</small></div>
-        <div class="metric-card"><span>Projected judge cost avoided / 10K trajectories</span><b>${projected_saved_cost:,.0f}</b><small>${JUDGE_COST_PER_CALL_USD:.2f}/judge call; this {active_trajectories}-trajectory demo saved {saved_verifier_calls} calls / ${estimated_saved_cost:.2f}.</small></div>
+        <div class="metric-card"><span>Projected judge cost avoided / 10K trajectories</span><b>{projected_saved_cost_display}</b><small>Same replay mix at ${JUDGE_COST_PER_CALL_USD:.2f}/judge call; this {active_trajectories}-trajectory demo saved {saved_verifier_calls} calls / ${estimated_saved_cost:.2f}.</small></div>
         <div class="metric-card"><span>Measured reward calls</span><b>{actual_stage_calls["reward"]}</b><small>Code-change run: {code_change_judge_calls} judge / {code_change_reward_calls} reward calls.</small></div>
       </section>
     </header>
@@ -1888,7 +1978,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         <div>
           <p class="eyebrow">Control Plane Shape</p>
           <h2>One declaration keeps every artifact aligned</h2>
-          <p>Reward rows, diff rows, training exports, owned row files, and judge audit logs stay in step with the same trajectory-level declaration.</p>
+          <p>Reward rows, diff rows, training exports, and owned row files share one trajectory-level declaration. Demo telemetry separately records which memoized stages actually ran.</p>
         </div>
       </div>
       {_render_artifact_map()}
@@ -1910,7 +2000,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         </div>
         <div class="contrast-panel">
           <strong>With CocoIndex</strong>
-          <p class="impact-badge">10K-row projection: ≈ {projected_saved_calls:,} judge calls / ${projected_saved_cost:,.0f} avoided.</p>
+          <p class="impact-badge">10K-row projection at the same replay mix: ≈ {projected_saved_calls_display} judge calls / {projected_saved_cost_display} avoided.</p>
           <p>Actual run: {total_calls} judge calls; no-op: {noop_stage_calls} stage calls.</p>
           <p>Python reward-code change: {code_change_judge_calls} judge calls, {code_change_reward_calls} reward calls.</p>
           <p>SQLite, JSONL, row files, and reports are declared together.</p>
@@ -1938,7 +2028,7 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
         <div>
           <p class="eyebrow">Training Row Sample</p>
           <h2>Reward metadata travels with the trainer-ready JSONL</h2>
-          <p>The export keeps the OpenAI-style messages field next to reward, label, reward-code version, model version, prompt template, and train-step provenance.</p>
+          <p>The export keeps the OpenAI-style messages field next to reward, label, reward-code version, judge-prompt hash, model version, prompt template, and train-step provenance.</p>
         </div>
       </div>
       <div class="sample-card"><pre>{_h(training_sample_json)}</pre></div>
@@ -1961,7 +2051,11 @@ def _render_dashboard(runs: Sequence[DemoRun], training_sample_json: str) -> str
 """
 
 
-def _write_demo_artifacts(runs: Sequence[DemoRun]) -> None:
+def _write_demo_artifacts(
+    runs: Sequence[DemoRun],
+    verifier_audit_records: Sequence[Mapping[str, object]],
+    stage_audit_records: Sequence[Mapping[str, object]],
+) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DEMO_RUNS_PATH.write_text(
         json.dumps([_demo_run_to_dict(run) for run in runs], indent=2) + "\n",
@@ -1971,11 +2065,15 @@ def _write_demo_artifacts(runs: Sequence[DemoRun]) -> None:
         _render_dashboard(runs, _training_row_sample_json()),
         encoding="utf-8",
     )
+    _write_jsonl(VERIFIER_AUDIT_PATH, verifier_audit_records)
+    _write_jsonl(STAGE_AUDIT_PATH, stage_audit_records)
 
 
 def _run_demo() -> None:
     _reset_demo(announce=False)
     runs: list[DemoRun] = []
+    verifier_audit_records: list[Mapping[str, object]] = []
+    stage_audit_records: list[Mapping[str, object]] = []
     scenarios = [
         (
             "backfill",
@@ -2020,11 +2118,14 @@ def _run_demo() -> None:
                 prepare()
             print(f"Running: {title}")
             runs.append(_run_update_step(run_id, title, description))
-    finally:
-        _restore_seed_inputs()
+        verifier_audit_records = _read_verifier_audit_records()
+        stage_audit_records = _read_stage_audit_records()
+    except BaseException:
+        _reset_demo(announce=False)
+        raise
     _reset_demo(announce=False)
     app.update_blocking()
-    _write_demo_artifacts(runs)
+    _write_demo_artifacts(runs, verifier_audit_records, stage_audit_records)
     print(f"Wrote {DASHBOARD_PATH.relative_to(BASE_DIR)}")
     print(f"Wrote {DEMO_RUNS_PATH.relative_to(BASE_DIR)}")
     print("Restored seed trajectories, balanced policy, and baseline outputs.")
